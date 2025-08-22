@@ -100,8 +100,8 @@ pub fn computeSSIMULACRA2(
 
 // -------------------- Internal metric implementation (ported) --------------------
 
-const ksize = 9;
-const radius = 4;
+const K_SIZE = 9;
+const RADIUS = 4;
 const vec_t: type = @Vector(16, f32);
 
 inline fn multiplyVec(src1: anytype, src2: anytype, dst: []f32) void {
@@ -120,58 +120,108 @@ pub inline fn multiply(src1: []const f32, src2: []const f32, dst: []f32, stride:
     }
 }
 
-fn blurH(srcp: []f32, dstp: []f32, kernel: [ksize]f32, w: i32) void {
-    var j: i32 = 0;
-    while (j < @min(w, radius)) : (j += 1) {
-        const dist_from_right: i32 = w - 1 - j;
+fn blurH(srcp: []f32, dstp: []f32, kernel: [K_SIZE]f32, w: u32) void {
+    // fast-path for very small widths: fall back to scalar safe implementation
+    const wu = @as(usize, w);
+    if (wu == 0) return;
+
+    // Pre-broadcast kernel into vectors once
+    var kvec: [K_SIZE]vec_t = undefined;
+    inline for (0..K_SIZE) |i| kvec[i] = @splat(kernel[i]);
+
+    // Left edge (same semantics as original)
+    const left_count = @min(@as(usize, w), @as(usize, RADIUS));
+    var j: usize = 0;
+    while (j < left_count) : (j += 1) {
+        const dist_from_right = @as(usize, w) - 1 - j;
         var sum: f32 = 0.0;
-        var k: i32 = 0;
-        while (k < radius) : (k += 1) {
-            const idx: i32 = if (j < radius - k) @min(radius - k - j, w - 1) else (j - radius + k);
-            sum += kernel[@intCast(k)] * srcp[@intCast(idx)];
+        var k: usize = 0;
+        while (k < @as(usize, RADIUS)) : (k += 1) {
+            const idx = if (j < (@as(usize, RADIUS) - k)) @min(@as(usize, RADIUS) - k - j, @as(usize, w) - 1) else (j - @as(usize, RADIUS) + k);
+            sum += kernel[k] * srcp[idx];
         }
-        k = radius;
-        while (k < ksize) : (k += 1) {
-            const idx: i32 = if (dist_from_right < k - radius) (j - @min(k - radius - dist_from_right, j)) else (j - radius + k);
-            sum += kernel[@intCast(k)] * srcp[@intCast(idx)];
+        k = @as(usize, RADIUS);
+        while (k < @as(usize, K_SIZE)) : (k += 1) {
+            const idx = if (dist_from_right < (k - @as(usize, RADIUS))) (j - @min(k - @as(usize, RADIUS) - dist_from_right, j)) else (j - @as(usize, RADIUS) + k);
+            sum += kernel[k] * srcp[idx];
         }
-        dstp[@intCast(j)] = sum;
+        dstp[j] = sum;
     }
 
-    j = radius;
-    while (j < w - @min(w, radius)) : (j += 1) {
-        var sum: f32 = 0.0;
-        var k: i32 = 0;
-        while (k < ksize) : (k += 1) {
-            sum += kernel[@intCast(k)] * srcp[@intCast(j - radius + k)];
+    // Middle region bounds (scalar-friendly)
+    const mid_start = @as(usize, RADIUS);
+    const mid_end_exclusive = @as(usize, w) - left_count; // matching original middle loop end
+
+    if (mid_start < mid_end_exclusive) {
+        // Vectorized interior block: process 16 outputs at a time.
+        // Only run vector loop while we have a full 16-wide block that is RADIUS-safe.
+        // Condition derived from needing src accesses up to j + 15 + RADIUS <= w - 1
+        const max_vec_block_start = if (mid_end_exclusive > mid_start + 15) mid_end_exclusive - 16 - @as(usize, RADIUS) else mid_start - 1;
+        j = mid_start;
+
+        // Vector loop: j steps by 16 and is guaranteed safe for kernel taps
+        while (j <= max_vec_block_start) : (j += 16) {
+            // For a block starting at element j we need src vectors starting at (j - RADIUS + k) for k=0..8.
+            // We use pointer casts to vec_t at arbitrary element offsets. These may be unaligned on some platforms.
+            var acc: vec_t = @splat(0.0);
+            // load & accumulate 9 neighboring vectors (each shifted by 1 element)
+            // use local alias to avoid repeated address computation
+            // slice-based loads (avoid @ptrCast for newer Zig)
+            // k0 .. k8
+            inline for (0..K_SIZE) |ki| {
+                var tmp: vec_t = undefined;
+                inline for (0..16) |lane| {
+                    tmp[lane] = srcp[j - @as(usize, RADIUS) + ki + lane];
+                }
+                acc = @mulAdd(vec_t, kvec[ki], tmp, acc);
+            }
+            // Store accumulated vector back to dstp
+            inline for (0..16) |lane| {
+                dstp[j + lane] = acc[lane];
+            }
         }
-        dstp[@intCast(j)] = sum;
+
+        // Scalar remainder of middle region
+        // start from either mid_start (if vector loop didn't run) or j (first unprocessed index)
+        var rem_start: usize = j;
+        while (rem_start < mid_end_exclusive) : (rem_start += 1) {
+            var sum: f32 = 0.0;
+            // here we are in the interior so simple indexing without clamps is valid
+            const base = rem_start - @as(usize, RADIUS);
+            var k: usize = 0;
+            while (k < @as(usize, K_SIZE)) : (k += 1) {
+                sum += kernel[k] * srcp[base + k];
+            }
+            dstp[rem_start] = sum;
+        }
     }
 
-    j = @max(radius, w - @min(w, radius));
-    while (j < w) : (j += 1) {
-        const dist_from_right: i32 = w - 1 - j;
+    // Right edge (same semantics as original)
+    const right_start = @max(@as(usize, RADIUS), @as(usize, w) - left_count);
+    j = right_start;
+    while (j < @as(usize, w)) : (j += 1) {
+        const dist_from_right = @as(usize, w) - 1 - j;
         var sum: f32 = 0.0;
-        var k: i32 = 0;
-        while (k < radius) : (k += 1) {
-            const idx: i32 = if (j < radius - k) @min(radius - k - j, w - 1) else (j - radius + k);
-            sum += kernel[@intCast(k)] * srcp[@intCast(idx)];
+        var k: usize = 0;
+        while (k < @as(usize, RADIUS)) : (k += 1) {
+            const idx = if (j < (@as(usize, RADIUS) - k)) @min(@as(usize, RADIUS) - k - j, @as(usize, w) - 1) else (j - @as(usize, RADIUS) + k);
+            sum += kernel[k] * srcp[idx];
         }
-        k = radius;
-        while (k < ksize) : (k += 1) {
-            const idx: i32 = if (dist_from_right < k - radius) (j - @min(k - radius - dist_from_right, j)) else (j - radius + k);
-            sum += kernel[@intCast(k)] * srcp[@intCast(idx)];
+        var k2: usize = @as(usize, RADIUS);
+        while (k2 < @as(usize, K_SIZE)) : (k2 += 1) {
+            const idx = if (dist_from_right < (k2 - @as(usize, RADIUS))) (j - @min(k2 - @as(usize, RADIUS) - dist_from_right, j)) else (j - @as(usize, RADIUS) + k2);
+            sum += kernel[k2] * srcp[idx];
         }
-        dstp[@intCast(j)] = sum;
+        dstp[j] = sum;
     }
 }
 
-inline fn blurV(src: anytype, dstp: []f32, kernel: [ksize]f32, w: u32) void {
+inline fn blurV(src: anytype, dstp: []f32, kernel: [K_SIZE]f32, w: u32) void {
     var j: u32 = 0;
     while (j < w) : (j += 1) {
         var accum: f32 = 0.0;
         var k: u32 = 0;
-        while (k < ksize) : (k += 1) {
+        while (k < K_SIZE) : (k += 1) {
             accum += kernel[k] * src[k][j];
         }
         dstp[j] = accum;
@@ -179,7 +229,7 @@ inline fn blurV(src: anytype, dstp: []f32, kernel: [ksize]f32, w: u32) void {
 }
 
 pub inline fn blur(src: []const f32, dst: []f32, stride: u32, w: u32, h: u32, tmp_row: []f32) void {
-    const kernel = [ksize]f32{
+    const kernel = [K_SIZE]f32{
         0.0076144188642501831054687500,
         0.0360749699175357818603515625,
         0.1095860823988914489746093750,
@@ -194,22 +244,22 @@ pub inline fn blur(src: []const f32, dst: []f32, stride: u32, w: u32, h: u32, tm
     const ih: i32 = @bitCast(h);
     while (i < ih) : (i += 1) {
         const ui: u32 = @bitCast(i);
-        var srcp_rows: [ksize][]const f32 = undefined;
+        var srcp_rows: [K_SIZE][]const f32 = undefined;
         const dstp_row: []f32 = dst[(ui * stride)..];
         const dist_from_bottom: i32 = ih - 1 - i;
 
         var k: i32 = 0;
-        while (k < radius) : (k += 1) {
-            const row: i32 = if (i < radius - k) (@min(radius - k - i, ih - 1)) else (i - radius + k);
+        while (k < RADIUS) : (k += 1) {
+            const row: i32 = if (i < RADIUS - k) (@min(RADIUS - k - i, ih - 1)) else (i - RADIUS + k);
             const urow: u32 = @bitCast(row);
             srcp_rows[@intCast(k)] = src[(urow * stride)..];
         }
-        k = radius;
-        while (k < ksize) : (k += 1) {
-            const row: i32 = if (dist_from_bottom < k - radius)
-                (i - @min(k - radius - dist_from_bottom, i))
+        k = RADIUS;
+        while (k < K_SIZE) : (k += 1) {
+            const row: i32 = if (dist_from_bottom < k - RADIUS)
+                (i - @min(k - RADIUS - dist_from_bottom, i))
             else
-                (i - radius + k);
+                (i - RADIUS + k);
             const urow: u32 = @bitCast(row);
             srcp_rows[@intCast(k)] = src[(urow * stride)..];
         }
