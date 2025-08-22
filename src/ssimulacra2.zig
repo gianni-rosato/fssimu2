@@ -35,6 +35,7 @@
 /// existing code, we keep the width constraint explicit here.
 const std = @import("std");
 const math = std.math;
+const vec_t: type = @Vector(16, f32);
 
 pub const Ssimu2Error = error{
     WidthNotMultipleOf16,
@@ -42,7 +43,7 @@ pub const Ssimu2Error = error{
     OutOfMemory,
 };
 
-/// Public convenience entry point.
+// entry point
 pub fn computeSSIMULACRA2(
     allocator: std.mem.Allocator,
     reference: []const u8,
@@ -100,86 +101,71 @@ pub fn computeSSIMULACRA2(
 
 // -------------------- Internal metric implementation (ported) --------------------
 
-const ksize = 9;
-const radius = 4;
-const vec_t: type = @Vector(16, f32);
+const K_SIZE = 9;
+const RADIUS = 4;
 
 inline fn multiplyVec(src1: anytype, src2: anytype, dst: []f32) void {
     dst[0..16].* = @as(vec_t, src1[0..16].*) * @as(vec_t, src2[0..16].*);
 }
 
 pub inline fn multiply(src1: []const f32, src2: []const f32, dst: []f32, stride: u32, w: u32, h: u32) void {
-    var y: u32 = 0;
-    while (y < h) : (y += 1) {
+    for (0..h) |y| {
         const row = y * stride;
         var x: u32 = 0;
-        while (x + 16 <= w) : (x += 16) {
+        // width is guaranteed multiple of 16
+        while (x + 16 <= w) : (x += 16)
             multiplyVec(src1[row + x ..], src2[row + x ..], dst[row + x ..]);
-        }
-        // (width is guaranteed multiple of 16, so no tail handling)
     }
 }
 
-fn blurH(srcp: []f32, dstp: []f32, kernel: [ksize]f32, w: i32) void {
-    var j: i32 = 0;
-    while (j < @min(w, radius)) : (j += 1) {
-        const dist_from_right: i32 = w - 1 - j;
+fn blurH(srcp: []f32, dstp: []f32, kernel: [K_SIZE]f32, w: u32) void {
+    for (0..@min(w, RADIUS)) |j| {
+        const dist_from_right = w - 1 - j;
         var sum: f32 = 0.0;
-        var k: i32 = 0;
-        while (k < radius) : (k += 1) {
-            const idx: i32 = if (j < radius - k) @min(radius - k - j, w - 1) else (j - radius + k);
+        for (0..RADIUS) |k| {
+            const idx = if (j < RADIUS - k) @min(RADIUS - k - j, w - 1) else (j - RADIUS + k);
             sum += kernel[@intCast(k)] * srcp[@intCast(idx)];
         }
-        k = radius;
-        while (k < ksize) : (k += 1) {
-            const idx: i32 = if (dist_from_right < k - radius) (j - @min(k - radius - dist_from_right, j)) else (j - radius + k);
+        for (RADIUS..K_SIZE) |k| {
+            const idx = if (dist_from_right < k - RADIUS) (j - @min(k - RADIUS - dist_from_right, j)) else (j - RADIUS + k);
             sum += kernel[@intCast(k)] * srcp[@intCast(idx)];
         }
-        dstp[@intCast(j)] = sum;
+        dstp[j] = sum;
     }
 
-    j = radius;
-    while (j < w - @min(w, radius)) : (j += 1) {
+    for (RADIUS..w - @min(w, RADIUS)) |j| {
         var sum: f32 = 0.0;
-        var k: i32 = 0;
-        while (k < ksize) : (k += 1) {
-            sum += kernel[@intCast(k)] * srcp[@intCast(j - radius + k)];
-        }
-        dstp[@intCast(j)] = sum;
+        for (0..K_SIZE) |k|
+            sum += kernel[k] * srcp[j - RADIUS + k];
+        dstp[j] = sum;
     }
 
-    j = @max(radius, w - @min(w, radius));
-    while (j < w) : (j += 1) {
-        const dist_from_right: i32 = w - 1 - j;
+    for (@max(RADIUS, w - @min(w, RADIUS))..w) |j| {
+        const dist_from_right = w - 1 - j;
         var sum: f32 = 0.0;
-        var k: i32 = 0;
-        while (k < radius) : (k += 1) {
-            const idx: i32 = if (j < radius - k) @min(radius - k - j, w - 1) else (j - radius + k);
+        for (0..RADIUS) |k| {
+            const idx = if (j < RADIUS - k) @min(RADIUS - k - j, w - 1) else (j - RADIUS + k);
             sum += kernel[@intCast(k)] * srcp[@intCast(idx)];
         }
-        k = radius;
-        while (k < ksize) : (k += 1) {
-            const idx: i32 = if (dist_from_right < k - radius) (j - @min(k - radius - dist_from_right, j)) else (j - radius + k);
-            sum += kernel[@intCast(k)] * srcp[@intCast(idx)];
+        for (RADIUS..K_SIZE) |k| {
+            const idx = if (dist_from_right < k - RADIUS) (j - @min(k - RADIUS - dist_from_right, j)) else (j - RADIUS + k);
+            sum += kernel[k] * srcp[idx];
         }
         dstp[@intCast(j)] = sum;
     }
 }
 
-inline fn blurV(src: anytype, dstp: []f32, kernel: [ksize]f32, w: u32) void {
-    var j: u32 = 0;
-    while (j < w) : (j += 1) {
+fn blurV(src: [K_SIZE][]const f32, dstp: []f32, kernel: [K_SIZE]f32, w: u32) void {
+    for (0..w) |j| {
         var accum: f32 = 0.0;
-        var k: u32 = 0;
-        while (k < ksize) : (k += 1) {
+        for (0..K_SIZE) |k|
             accum += kernel[k] * src[k][j];
-        }
         dstp[j] = accum;
     }
 }
 
 pub inline fn blur(src: []const f32, dst: []f32, stride: u32, w: u32, h: u32, tmp_row: []f32) void {
-    const kernel = [ksize]f32{
+    const kernel = [K_SIZE]f32{
         0.0076144188642501831054687500,
         0.0360749699175357818603515625,
         0.1095860823988914489746093750,
@@ -194,24 +180,24 @@ pub inline fn blur(src: []const f32, dst: []f32, stride: u32, w: u32, h: u32, tm
     const ih: i32 = @bitCast(h);
     while (i < ih) : (i += 1) {
         const ui: u32 = @bitCast(i);
-        var srcp_rows: [ksize][]const f32 = undefined;
+        var srcp_rows: [K_SIZE][]const f32 = undefined;
         const dstp_row: []f32 = dst[(ui * stride)..];
         const dist_from_bottom: i32 = ih - 1 - i;
 
-        var k: i32 = 0;
-        while (k < radius) : (k += 1) {
-            const row: i32 = if (i < radius - k) (@min(radius - k - i, ih - 1)) else (i - radius + k);
+        for (0..RADIUS) |k| {
+            const ki: i32 = @intCast(k);
+            const row: i32 = if (i < RADIUS - ki) (@min(RADIUS - ki - i, ih - 1)) else (i - RADIUS + ki);
             const urow: u32 = @bitCast(row);
-            srcp_rows[@intCast(k)] = src[(urow * stride)..];
+            srcp_rows[k] = src[(urow * stride)..];
         }
-        k = radius;
-        while (k < ksize) : (k += 1) {
-            const row: i32 = if (dist_from_bottom < k - radius)
-                (i - @min(k - radius - dist_from_bottom, i))
+        for (RADIUS..K_SIZE) |k| {
+            const ki: i32 = @intCast(k);
+            const row: i32 = if (dist_from_bottom < ki - RADIUS)
+                (i - @min(ki - RADIUS - dist_from_bottom, i))
             else
-                (i - radius + k);
+                (i - RADIUS + ki);
             const urow: u32 = @bitCast(row);
-            srcp_rows[@intCast(k)] = src[(urow * stride)..];
+            srcp_rows[k] = src[(urow * stride)..];
         }
 
         blurV(srcp_rows, tmp_row, kernel, w);
@@ -308,8 +294,7 @@ inline fn xybVec(src: [3][]const f32, dst: [3][]f32) void {
 pub inline fn toXYB(srcp: [3][]const f32, dstp: [3][]f32, stride: u32, w: u32, h: u32) void {
     var src = srcp;
     var dst = dstp;
-    var y: u32 = 0;
-    while (y < h) : (y += 1) {
+    for (0..h) |_| {
         var x: u32 = 0;
         while (x + 16 <= w) : (x += 16) {
             const x2 = x + 16;
@@ -324,7 +309,7 @@ pub inline fn toXYB(srcp: [3][]const f32, dstp: [3][]f32, stride: u32, w: u32, h
     }
 }
 
-inline fn tothe4th(y: f64) f64 {
+inline fn pow4(y: f64) f64 {
     const x = y * y;
     return x * x;
 }
@@ -359,7 +344,7 @@ inline fn ssimMap(
             const denom_s: f64 = (s11[row + x] - m11) + (s22[row + x] - m22) + 0.0009;
             const d1: f64 = @max(1.0 - ((num_m * num_s) / denom_s), 0.0);
             sum1[0] += d1;
-            sum1[1] += tothe4th(d1);
+            sum1[1] += pow4(d1);
         }
     }
     plane_avg_ssim[plane * 2] = one_per_pixels * sum1[0];
@@ -388,10 +373,10 @@ inline fn edgeMap(
                 (1.0 + @as(f64, @abs(im1[row + x] - mu1[row + x]))) - 1.0;
             const artifact: f64 = @max(d1, 0.0);
             sum2[0] += artifact;
-            sum2[1] += tothe4th(artifact);
+            sum2[1] += pow4(artifact);
             const detail_lost: f64 = @max(-d1, 0.0);
             sum2[2] += detail_lost;
-            sum2[3] += tothe4th(detail_lost);
+            sum2[3] += pow4(detail_lost);
         }
     }
     plane_avg_edge[plane * 4] = one_per_pixels * sum2[0];
@@ -533,11 +518,10 @@ inline fn score(plane_avg_ssim: [6][6]f64, plane_avg_edge: [6][12]f64) f64 {
         2.326765642916932 * ssim_accum -
         0.020884521182843837 * ssim_accum * ssim_accum;
 
-    if (ssim_accum > 0.0) {
-        ssim_accum = math.pow(f64, ssim_accum, 0.6276336467831387) * -10.0 + 100.0;
-    } else {
+    if (ssim_accum > 0.0)
+        ssim_accum = math.pow(f64, ssim_accum, 0.6276336467831387) * -10.0 + 100.0
+    else
         ssim_accum = 100.0;
-    }
     return ssim_accum;
 }
 
@@ -549,14 +533,11 @@ inline fn downscale(src: [3][]f32, dst: [3][]f32, src_stride: u32, in_w: u32, in
     const dst_stride = @divTrunc((src_stride + uscale - 1), uscale);
     const normalize: f32 = 1.0 / (fscale * fscale);
 
-    var plane: u32 = 0;
-    while (plane < 3) : (plane += 1) {
+    for (0..3) |plane| {
         const srcp = src[plane];
         var dstp = dst[plane];
-        var oy: u32 = 0;
-        while (oy < out_h) : (oy += 1) {
-            var ox: u32 = 0;
-            while (ox < out_w) : (ox += 1) {
+        for (0..out_h) |oy| {
+            for (0..out_w) |ox| {
                 var sum: f32 = 0.0;
                 var iy: u32 = 0;
                 while (iy < uscale) : (iy += 1) {
@@ -589,12 +570,11 @@ pub fn process(
 
     var temp6x3: [6][3][]f32 = undefined;
     var x: u32 = 0;
-    for (0..6) |i| {
+    for (0..6) |i|
         for (0..3) |ii| {
             temp6x3[i][ii] = temp[x..(x + wh)];
             x += wh;
-        }
-    }
+        };
 
     const srcp1b = temp6x3[0];
     const srcp2b = temp6x3[1];
@@ -622,8 +602,7 @@ pub fn process(
     var w2 = w;
     var h2 = h;
 
-    var scale: u32 = 0;
-    while (scale < 6) : (scale += 1) {
+    for (0..6) |scale| {
         if (scale > 0) {
             downscale(srcp1b, srcp1b, stride2, w2, h2);
             downscale(srcp2b, srcp2b, stride2, w2, h2);
@@ -686,8 +665,7 @@ pub fn process(
 
 fn makeSRGBToLinearLUT() [256]f32 {
     var lut: [256]f32 = undefined;
-    var i: usize = 0;
-    while (i < 256) : (i += 1) {
+    for (0..256) |i| {
         const c = @as(f32, @floatFromInt(i)) / 255.0;
         lut[i] = if (c <= 0.04045) c / 12.92 else math.pow(f32, (c + 0.055) / 1.055, 2.4);
     }
@@ -722,10 +700,8 @@ fn sRGBInterleavedToPlanarLinear(
 ) void {
     const w = @as(usize, width);
     const h = @as(usize, height);
-    var y: usize = 0;
-    while (y < h) : (y += 1) {
-        var x: usize = 0;
-        while (x < w) : (x += 1) {
+    for (0..h) |y|
+        for (0..w) |x| {
             const idx = (y * w + x) * @as(usize, channels);
             const r = SRGB_LUT[src[idx + 0]];
             const g = SRGB_LUT[src[idx + 1]];
@@ -733,6 +709,5 @@ fn sRGBInterleavedToPlanarLinear(
             dst_planes[0][y * w + x] = r;
             dst_planes[1][y * w + x] = g;
             dst_planes[2][y * w + x] = b;
-        }
-    }
+        };
 }
