@@ -119,6 +119,50 @@ fn blurH(srcp: []f32, dstp: []f32, kernel: [K_SIZE]f32, w: i32) void {
     }
 }
 
+fn gaussianKernel(kernel: []f32, radius: usize, sigma: f32) void {
+    const size = kernel.len;
+    const scaler: f32 = -1.0 / (2.0 * sigma * sigma);
+    var sum: f32 = 0.0;
+    var i: usize = 0;
+    while (i < size) : (i += 1) {
+        const x = @as(f32, @floatFromInt(i)) - @as(f32, @floatFromInt(radius));
+        const val = @as(f32, math.exp(@as(f64, scaler * x * x)));
+        kernel[i] = val;
+        sum += val;
+    }
+    i = 0;
+    while (i < size) : (i += 1) {
+        kernel[i] /= sum;
+    }
+}
+
+fn convolveXSampleAndTranspose(src: []const f32, out: []f32, xs: u32, ys: u32, kernel: []const f32) void {
+    const size = kernel.len;
+    const r = size / 2;
+    var y: u32 = 0;
+    while (y < ys) : (y += 1) {
+        const row_off = @as(usize, y) * @as(usize, xs);
+        var x: i32 = 0;
+        while (x < @as(i32, @intCast(xs))) : (x += 1) {
+            var sum: f32 = 0.0;
+            var k: i32 = 0;
+            const r_i32 = @as(i32, @intCast(r));
+            while (k < @as(i32, @intCast(size))) : (k += 1) {
+                const xi = x + k - r_i32;
+                const id = if (xi < 0) 0 else if (xi >= @as(i32, @intCast(xs))) xs - 1 else @as(u32, @intCast(xi));
+                sum += src[row_off + id] * kernel[@intCast(k)];
+            }
+            // transpose write
+            out[@as(usize, @intCast(x)) * @as(usize, ys) + @as(usize, y)] = sum;
+        }
+    }
+}
+
+fn slowGaussian(src: []const f32, tmp: []f32, dst: []f32, xs: u32, ys: u32, kernel: []const f32) void {
+    convolveXSampleAndTranspose(src, tmp, xs, ys, kernel);
+    convolveXSampleAndTranspose(tmp, dst, ys, xs, kernel);
+}
+
 inline fn blurV(src: anytype, dstp: []f32, kernel: [K_SIZE]f32, w: u32) void {
     var j: u32 = 0;
     while (j < w) : (j += 1) {
@@ -131,8 +175,8 @@ inline fn blurV(src: anytype, dstp: []f32, kernel: [K_SIZE]f32, w: u32) void {
     }
 }
 
-inline fn blur(src: []const f32, dst: []f32, stride: u32, w: u32, h: u32, tmp_row: []f32) void {
-    const kernel = [K_SIZE]f32{
+inline fn blur(src: []const f32, dst: []f32, w: u32, h: u32, tmp: []f32) void {
+    var kernel: [9]f32 = [_]f32{
         0.0076144188642501831054687500,
         0.0360749699175357818603515625,
         0.1095860823988914489746093750,
@@ -143,33 +187,7 @@ inline fn blur(src: []const f32, dst: []f32, stride: u32, w: u32, h: u32, tmp_ro
         0.0360749699175357818603515625,
         0.0076144188642501831054687500,
     };
-    var i: i32 = 0;
-    const ih: i32 = @bitCast(h);
-    while (i < ih) : (i += 1) {
-        const ui: u32 = @bitCast(i);
-        var srcp_rows: [K_SIZE][]const f32 = undefined;
-        const dstp_row: []f32 = dst[(ui * stride)..];
-        const dist_from_bottom: i32 = ih - 1 - i;
-
-        var k: i32 = 0;
-        while (k < RADIUS) : (k += 1) {
-            const row: i32 = if (i < RADIUS - k) (@min(RADIUS - k - i, ih - 1)) else (i - RADIUS + k);
-            const urow: u32 = @bitCast(row);
-            srcp_rows[@intCast(k)] = src[(urow * stride)..];
-        }
-        k = RADIUS;
-        while (k < K_SIZE) : (k += 1) {
-            const row: i32 = if (dist_from_bottom < k - RADIUS)
-                (i - @min(k - RADIUS - dist_from_bottom, i))
-            else
-                (i - RADIUS + k);
-            const urow: u32 = @bitCast(row);
-            srcp_rows[@intCast(k)] = src[(urow * stride)..];
-        }
-
-        blurV(srcp_rows, tmp_row, kernel, w);
-        blurH(tmp_row, dstp_row, kernel, @intCast(w));
-    }
+    slowGaussian(src, tmp, dst, w, h, &kernel);
 }
 
 const K_D0: f32 = 0.0037930734;
@@ -558,8 +576,8 @@ fn process(
         @memcpy(srcp2b[i], srcp2[i]);
     }
 
-    // Single scratch buffer for all blurs (width never exceeds original stride)
-    const scratch = allocator.alignedAlloc(f32, .of(f32), stride) catch unreachable;
+    // Single scratch buffer for all blurs
+    const scratch = allocator.alignedAlloc(f32, .of(f32), wh) catch unreachable;
     defer allocator.free(scratch);
 
     var plane_avg_ssim: [6][6]f64 = undefined;
@@ -585,16 +603,16 @@ fn process(
         var plane: u32 = 0;
         while (plane < 3) : (plane += 1) {
             multiply(tmpp1[plane], tmpp1[plane], tmpp3, stride2, w2, h2);
-            blur(tmpp3, tmpps11, stride2, w2, h2, scratch);
+            blur(tmpp3, tmpps11, w2, h2, scratch);
 
             multiply(tmpp2[plane], tmpp2[plane], tmpp3, stride2, w2, h2);
-            blur(tmpp3, tmpps22, stride2, w2, h2, scratch);
+            blur(tmpp3, tmpps22, w2, h2, scratch);
 
             multiply(tmpp1[plane], tmpp2[plane], tmpp3, stride2, w2, h2);
-            blur(tmpp3, tmpps12, stride2, w2, h2, scratch);
+            blur(tmpp3, tmpps12, w2, h2, scratch);
 
-            blur(tmpp1[plane], tmppmu1, stride2, w2, h2, scratch);
-            blur(tmpp2[plane], tmpp3, stride2, w2, h2, scratch);
+            blur(tmpp1[plane], tmppmu1, w2, h2, scratch);
+            blur(tmpp2[plane], tmpp3, w2, h2, scratch);
 
             ssimMap(
                 tmpps11,
