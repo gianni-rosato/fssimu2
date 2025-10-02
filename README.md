@@ -8,14 +8,15 @@ Fast [SSIMULACRA2](https://github.com/cloudinary/ssimulacra2/tree/main) derivati
 fssimu2 | [version]
 
 usage:
-  fssimu2 [--json] reference distorted
+  fssimu2 [options] <reference> <distorted>
 
 options:
-  --json          output result as json
-  -h, --help      show this help
-  -v, --version   show version information
+  --json               output result as json
+  --err-map <out>      save error map to .png/.tga
+  -h, --help           show this help
+  -v, --version        show version information
 
-sRGB PNG, PAM, JPEG, WebP, or AVIF expected
+sRGB PNG, PAM, JPEG, WebP, or AVIF input expected
 ```
 
 Example output:
@@ -78,6 +79,16 @@ LEVELS: 1.0 2.0 4.0
  SRCC (Spearman): 0.999403
  KRCC (Kendall): 0.987748
 ```
+
+## Error Map
+
+The `ssimu2` binary optionally allows specifying an error map output image as either an uncompressed `.tga` (Targa) or PNG.
+
+Error maps use the [Turbo](https://research.google/blog/turbo-an-improved-rainbow-colormap-for-visualization/) color map for error visualization, which emphasizes visually obvious errors well.
+
+An example output is provided here, generated using `./ssimu2 --err-map map.png ref.png dst_bad.png` which resulted in a score of `49.37005220`.
+
+![Sample Error Map](./map.webp)
 
 ## Compilation
 

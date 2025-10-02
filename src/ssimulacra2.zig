@@ -1,6 +1,7 @@
 const std = @import("std");
 const math = std.math;
 const scl = @import("linearlight.zig");
+const err_map = @import("err_map.zig");
 
 // SSIMULACRA2 Metric Implementation
 
@@ -19,6 +20,7 @@ pub fn computeSsimu2(
     width: u32,
     height: u32,
     channels: u32,
+    error_map: ?[]u32,
 ) Ssimu2Error!f64 {
     if (channels != 3 and channels != 4) return Ssimu2Error.InvalidChannelCount;
 
@@ -59,7 +61,7 @@ pub fn computeSsimu2(
         dist_planes[0], dist_planes[1], dist_planes[2],
     };
 
-    return process(allocator, ref_const, dist_const, stride, width, height);
+    return process(allocator, ref_const, dist_const, stride, width, height, error_map);
 }
 
 inline fn multiply(src1: []const f32, src2: []const f32, dst: []f32, stride: u32, w: u32, h: u32) void {
@@ -178,11 +180,131 @@ const K_D1: f32 = std.math.lossyCast(f32, math.cbrt(@as(f32, K_D0)));
 const V00 = 0.0;
 const V05 = 0.5;
 const V10 = 1.0;
-
 const V001 = 0.01;
 const V055 = 0.55;
 const V042 = 0.42;
 const V140 = 14.0;
+
+const weight = [108]f64{
+    0.0,
+    0.0007376606707406586,
+    0.0,
+    0.0,
+    0.0007793481682867309,
+    0.0,
+    0.0,
+    0.0004371155730107379,
+    0.0,
+    1.1041726426657346,
+    0.00066284834129271,
+    0.00015231632783718752,
+    0.0,
+    0.0016406437456599754,
+    0.0,
+    1.8422455520539298,
+    11.441172603757666,
+    0.0,
+    0.0007989109436015163,
+    0.000176816438078653,
+    0.0,
+    1.8787594979546387,
+    10.94906990605142,
+    0.0,
+    0.0007289346991508072,
+    0.9677937080626833,
+    0.0,
+    0.00014003424285435884,
+    0.9981766977854967,
+    0.00031949755934435053,
+    0.0004550992113792063,
+    0.0,
+    0.0,
+    0.0013648766163243398,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    7.466890328078848,
+    0.0,
+    17.445833984131262,
+    0.0006235601634041466,
+    0.0,
+    0.0,
+    6.683678146179332,
+    0.00037724407979611296,
+    1.027889937768264,
+    225.20515300849274,
+    0.0,
+    0.0,
+    19.213238186143016,
+    0.0011401524586618361,
+    0.001237755635509985,
+    176.39317598450694,
+    0.0,
+    0.0,
+    24.43300999870476,
+    0.28520802612117757,
+    0.0004485436923833408,
+    0.0,
+    0.0,
+    0.0,
+    34.77906344483772,
+    44.835625328877896,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0008680556573291698,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0005313191874358747,
+    0.0,
+    0.00016533814161379112,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0004179171803251336,
+    0.0017290828234722833,
+    0.0,
+    0.0020827005846636437,
+    0.0,
+    0.0,
+    8.826982764996862,
+    23.19243343998926,
+    0.0,
+    95.1080498811086,
+    0.9863978034400682,
+    0.9834382792465353,
+    0.0012286405048278493,
+    171.2667255897307,
+    0.9807858872435379,
+    0.0,
+    0.0,
+    0.0,
+    0.0005130064588990679,
+    0.0,
+    0.00010854057858411537,
+};
+
+inline fn getWeight(c: i32, scale: i32, map: i32, norm: i32) f64 {
+    std.debug.assert(c >= 0 and c < 3);
+    std.debug.assert(scale >= 0 and scale < 6);
+    std.debug.assert(map >= 0 and map < 3);
+    std.debug.assert(norm >= 0 and norm < 2);
+    const idx = 36 * c + 6 * scale + 3 * norm + map;
+    std.debug.assert(idx >= 0 and idx < 108);
+    return weight[@intCast(idx)];
+}
 
 const K_M02 = 0.078;
 const K_M00 = 0.30;
@@ -287,6 +409,8 @@ inline fn ssimMap(
     plane: u32,
     one_per_pixels: f64,
     plane_avg_ssim: []f64,
+    error_map: ?[]f32,
+    scale: u32,
 ) void {
     var sum1 = [2]f64{ 0.0, 0.0 };
     var y: u32 = 0;
@@ -306,6 +430,14 @@ inline fn ssimMap(
             const d1: f64 = @max(1.0 - ((num_m * num_s) / denom_s), 0.0);
             sum1[0] += d1;
             sum1[1] += tothe4th(d1);
+
+            if (error_map) |emap| {
+                const d: f32 = @floatCast(d1);
+                const weight1: f32 = @floatCast(getWeight(@intCast(plane), @intCast(scale), 0, 0));
+                const weight2: f32 = @floatCast(getWeight(@intCast(plane), @intCast(scale), 0, 1));
+                emap[row + x] += weight1 * d;
+                emap[row + x] += weight2 * d;
+            }
         }
     }
     plane_avg_ssim[plane * 2] = one_per_pixels * sum1[0];
@@ -323,6 +455,8 @@ inline fn edgeMap(
     plane: u32,
     one_per_pixels: f64,
     plane_avg_edge: []f64,
+    error_map: ?[]f32,
+    scale: u32,
 ) void {
     var sum2 = [4]f64{ 0.0, 0.0, 0.0, 0.0 };
     var y: u32 = 0;
@@ -338,6 +472,19 @@ inline fn edgeMap(
             const detail_lost: f64 = @max(-d1, 0.0);
             sum2[2] += detail_lost;
             sum2[3] += tothe4th(detail_lost);
+
+            if (error_map) |emap| {
+                const artifact_f: f32 = @floatCast(artifact);
+                const detail_lost_f: f32 = @floatCast(detail_lost);
+                const weight1: f32 = @floatCast(getWeight(@intCast(plane), @intCast(scale), 1, 0));
+                const weight2: f32 = @floatCast(getWeight(@intCast(plane), @intCast(scale), 1, 1));
+                const weight3: f32 = @floatCast(getWeight(@intCast(plane), @intCast(scale), 2, 0));
+                const weight4: f32 = @floatCast(getWeight(@intCast(plane), @intCast(scale), 2, 1));
+                emap[row + x] += weight1 * @abs(artifact_f);
+                emap[row + x] += weight2 * @abs(artifact_f);
+                emap[row + x] += weight3 * @abs(detail_lost_f);
+                emap[row + x] += weight4 * @abs(detail_lost_f);
+            }
         }
     }
     plane_avg_edge[plane * 4] = one_per_pixels * sum2[0];
@@ -347,117 +494,6 @@ inline fn edgeMap(
 }
 
 inline fn score(plane_avg_ssim: [6][6]f64, plane_avg_edge: [6][12]f64) f64 {
-    const weight = [108]f64{
-        0.0,
-        0.0007376606707406586,
-        0.0,
-        0.0,
-        0.0007793481682867309,
-        0.0,
-        0.0,
-        0.0004371155730107379,
-        0.0,
-        1.1041726426657346,
-        0.00066284834129271,
-        0.00015231632783718752,
-        0.0,
-        0.0016406437456599754,
-        0.0,
-        1.8422455520539298,
-        11.441172603757666,
-        0.0,
-        0.0007989109436015163,
-        0.000176816438078653,
-        0.0,
-        1.8787594979546387,
-        10.94906990605142,
-        0.0,
-        0.0007289346991508072,
-        0.9677937080626833,
-        0.0,
-        0.00014003424285435884,
-        0.9981766977854967,
-        0.00031949755934435053,
-        0.0004550992113792063,
-        0.0,
-        0.0,
-        0.0013648766163243398,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        7.466890328078848,
-        0.0,
-        17.445833984131262,
-        0.0006235601634041466,
-        0.0,
-        0.0,
-        6.683678146179332,
-        0.00037724407979611296,
-        1.027889937768264,
-        225.20515300849274,
-        0.0,
-        0.0,
-        19.213238186143016,
-        0.0011401524586618361,
-        0.001237755635509985,
-        176.39317598450694,
-        0.0,
-        0.0,
-        24.43300999870476,
-        0.28520802612117757,
-        0.0004485436923833408,
-        0.0,
-        0.0,
-        0.0,
-        34.77906344483772,
-        44.835625328877896,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0008680556573291698,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0005313191874358747,
-        0.0,
-        0.00016533814161379112,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0004179171803251336,
-        0.0017290828234722833,
-        0.0,
-        0.0020827005846636437,
-        0.0,
-        0.0,
-        8.826982764996862,
-        23.19243343998926,
-        0.0,
-        95.1080498811086,
-        0.9863978034400682,
-        0.9834382792465353,
-        0.0012286405048278493,
-        171.2667255897307,
-        0.9807858872435379,
-        0.0,
-        0.0,
-        0.0,
-        0.0005130064588990679,
-        0.0,
-        0.00010854057858411537,
-    };
-
     var ssim_accum: f64 = 0.0;
     var idx: usize = 0;
 
@@ -527,9 +563,11 @@ fn process(
     stride: u32,
     w: u32,
     h: u32,
+    error_map: ?[]u32,
 ) f64 {
     const wh: u32 = stride * h;
-    const temp_alloc = allocator.alignedAlloc(f32, .of(f32), wh * 18) catch unreachable;
+    const error_map_count: u32 = if (error_map != null) 2 else 0; // error_accum and error_scale
+    const temp_alloc = allocator.alignedAlloc(f32, .of(f32), wh * (18 + error_map_count)) catch unreachable;
     defer allocator.free(temp_alloc);
     var temp = temp_alloc[0..];
 
@@ -540,6 +578,16 @@ fn process(
             temp6x3[i][ii] = temp[x..(x + wh)];
             x += wh;
         }
+    }
+
+    var error_accum: []f32 = undefined;
+    var error_scale: []f32 = undefined;
+    if (error_map != null) {
+        error_accum = temp[x..(x + wh)];
+        x += wh;
+        error_scale = temp[x..(x + wh)];
+        x += wh;
+        @memset(error_scale, 0.0);
     }
 
     const srcp1b = temp6x3[0];
@@ -578,6 +626,11 @@ fn process(
             h2 = @divTrunc((h2 + 1), 2);
         }
 
+        if (error_map != null) {
+            const current_wh = stride2 * h2;
+            @memset(error_scale[0..current_wh], 0.0);
+        }
+
         const one_per_pixels: f64 = 1.0 / @as(f64, @floatFromInt(w2 * h2));
         toXYB(srcp1b, tmpp1, stride2, w2, h2);
         toXYB(srcp2b, tmpp2, stride2, w2, h2);
@@ -608,6 +661,8 @@ fn process(
                 plane,
                 one_per_pixels,
                 &plane_avg_ssim[scale],
+                if (error_map != null) error_scale else null,
+                scale,
             );
 
             edgeMap(
@@ -621,9 +676,22 @@ fn process(
                 plane,
                 one_per_pixels,
                 &plane_avg_edge[scale],
+                if (error_map != null) error_scale else null,
+                @intCast(scale),
             );
         }
+
+        if (error_map != null) {
+            if (scale == 0) {
+                @memcpy(error_accum, error_scale);
+            } else if (scale < 3) {
+                err_map.upscaleAndAccumulate(error_scale, error_accum, stride2, w2, h2, stride, w, h);
+            }
+        }
     }
+
+    if (error_map) |emap|
+        err_map.generateErrorMap(error_accum, emap, stride, w, h);
 
     return score(plane_avg_ssim, plane_avg_edge);
 }

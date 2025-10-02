@@ -28,6 +28,7 @@ export fn ssimulacra2_score(
         @intCast(width),
         @intCast(height),
         @intCast(channels),
+        null,
     );
 
     if (result) |val| {
