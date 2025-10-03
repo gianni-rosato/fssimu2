@@ -439,14 +439,18 @@ fn saveTarga(allocator: std.mem.Allocator, path: []const u8, bgra_data: []const 
     try file.writeAll(tga_data);
 }
 
-pub fn saveErrorMap(allocator: std.mem.Allocator, path: []const u8, error_map: []const u32, width: u16, height: u16) !void {
+pub fn saveErrorMap(allocator: std.mem.Allocator, path: []const u8, error_map: []const f32, width: u16, height: u16) !void {
     const pixels = @as(usize, width) * @as(usize, height);
     if (hasExtension(path, ".tga")) {
-        // Convert to BGRA for TGA
+        // Convert to BGRA for TGA using turbo colormap
         const bgra_data = try allocator.alloc(u8, pixels * 4);
         defer allocator.free(bgra_data);
         for (0..pixels) |i| {
-            const color = error_map[i];
+            const value = error_map[i];
+            // Clamp value to 0-1 range
+            const clamped = @max(0.0, @min(1.0, value));
+            const index = @as(u8, @intFromFloat(clamped * 255.0));
+            const color: u32 = @import("err_map.zig").TURBO_MAP[index];
             bgra_data[i * 4 + 0] = @intCast((color >> 16) & 0xFF); // B
             bgra_data[i * 4 + 1] = @intCast((color >> 8) & 0xFF); // G
             bgra_data[i * 4 + 2] = @intCast((color >> 0) & 0xFF); // R
@@ -454,11 +458,15 @@ pub fn saveErrorMap(allocator: std.mem.Allocator, path: []const u8, error_map: [
         }
         try saveTarga(allocator, path, bgra_data, width, height);
     } else {
-        // Convert to RGBA for PNG
+        // Convert to RGBA for PNG using turbo colormap
         const rgba_data = try allocator.alloc(u8, pixels * 4);
         defer allocator.free(rgba_data);
         for (0..pixels) |i| {
-            const color = error_map[i];
+            const value = error_map[i];
+            // Clamp value to 0-1 range
+            const clamped = @max(0.0, @min(1.0, value));
+            const index = @as(u8, @intFromFloat(clamped * 255.0));
+            const color: u32 = @import("err_map.zig").TURBO_MAP[index];
             rgba_data[i * 4 + 0] = @intCast((color >> 0) & 0xFF); // R
             rgba_data[i * 4 + 1] = @intCast((color >> 8) & 0xFF); // G
             rgba_data[i * 4 + 2] = @intCast((color >> 16) & 0xFF); // B
