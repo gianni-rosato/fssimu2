@@ -24,19 +24,28 @@ pub fn main() !void {
     while (args_iter.next()) |a| try args.append(allocator, a);
 
     var json_output = false;
+    var error_map_path: ?[]const u8 = null;
     var positional: [2]?[]const u8 = .{ null, null };
     var pos_index: usize = 0;
 
     var show_help = false;
     var show_version = false;
 
-    for (args.items[1..]) |arg| {
+    var i: usize = 1;
+    while (i < args.items.len) : (i += 1) {
+        const arg = args.items[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             show_help = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             show_version = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             json_output = true;
+        } else if (std.mem.eql(u8, arg, "--err-map")) {
+            i += 1;
+            if (i >= args.items.len) {
+                return usageExtra("--err-map requires a path argument");
+            }
+            error_map_path = args.items[i];
         } else {
             if (pos_index >= 2)
                 return usageExtra("Too many positional arguments provided.");
@@ -73,6 +82,15 @@ pub fn main() !void {
     const dist_rgb: []u8 = if (dst_has_alpha) try io.toRGB8(allocator, dist_image) else dist_image.data;
     defer if (dst_has_alpha) allocator.free(dist_rgb);
 
+    // Allocate error map buffer if requested
+    var error_map_buffer: ?[]u32 = null;
+    defer if (error_map_buffer) |buf| allocator.free(buf);
+
+    if (error_map_path != null) {
+        const pixel_count = @as(usize, @intCast(ref_image.width)) * @as(usize, @intCast(ref_image.height));
+        error_map_buffer = try allocator.alloc(u32, pixel_count);
+    }
+
     const score = ssim.computeSsimu2(
         allocator,
         ref_rgb,
@@ -80,6 +98,7 @@ pub fn main() !void {
         @intCast(ref_image.width),
         @intCast(ref_image.height),
         3,
+        error_map_buffer,
     ) catch |e| {
         switch (e) {
             ssim.Ssimu2Error.InvalidChannelCount => {
@@ -90,6 +109,16 @@ pub fn main() !void {
             },
         }
     };
+
+    // Save error map if requested
+    if (error_map_path) |path| {
+        if (error_map_buffer) |buf| {
+            try io.saveErrorMap(allocator, path, buf, @intCast(ref_image.width), @intCast(ref_image.height));
+            if (!json_output) {
+                print("Error map saved to: {s}\n", .{path});
+            }
+        }
+    }
 
     if (json_output) {
         print(
@@ -104,12 +133,13 @@ fn usage() void {
     print("\x1b[34mfssimu2\x1b[0m | {s}\n\n", .{VERSION});
     print(
         \\usage:
-        \\  fssimu2 [--json] reference distorted
+        \\  fssimu2 [options] <reference> <distorted>
         \\
         \\options:
-        \\  --json          output result as json
-        \\  -h, --help      show this help
-        \\  -v, --version   show version information
+        \\  --json               output result as json
+        \\  --err-map <out>      save error map to .png/.tga
+        \\  -h, --help           show this help
+        \\  -v, --version        show version information
     , .{});
     print("\n\n\x1b[37msRGB PNG, PAM, JPEG, WebP, or AVIF input expected\x1b[0m\n", .{});
 }

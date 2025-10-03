@@ -376,3 +376,94 @@ pub fn toRGB8(allocator: std.mem.Allocator, img: Image) ![]u8 {
     }
     return rgb;
 }
+
+fn savePNG(path: []const u8, rgba_data: []const u8, width: u16, height: u16) !void {
+    const ctx = c.spng_ctx_new(c.SPNG_CTX_ENCODER);
+    if (ctx == null) return error.FailedCreateContext;
+    defer c.spng_ctx_free(ctx);
+
+    if (c.spng_set_option(ctx, c.SPNG_ENCODE_TO_BUFFER, 1) != 0)
+        return error.FailedSetOption;
+
+    var ihdr: c.spng_ihdr = undefined;
+    ihdr.width = width;
+    ihdr.height = height;
+    ihdr.bit_depth = 8;
+    ihdr.color_type = c.SPNG_COLOR_TYPE_TRUECOLOR_ALPHA;
+    ihdr.compression_method = 0;
+    ihdr.filter_method = 0;
+    ihdr.interlace_method = 0;
+
+    if (c.spng_set_ihdr(ctx, &ihdr) != 0)
+        return error.FailedSetIhdr;
+    if (c.spng_encode_image(ctx, rgba_data.ptr, rgba_data.len, c.SPNG_FMT_PNG, c.SPNG_ENCODE_FINALIZE) != 0)
+        return error.FailedEncode;
+
+    var png_size: usize = 0;
+    const png_buf = c.spng_get_png_buffer(ctx, &png_size, null);
+    if (png_buf == null) return error.FailedGetBuffer;
+
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+    const png_slice = @as([*]const u8, @ptrCast(png_buf))[0..png_size];
+    try file.writeAll(png_slice);
+}
+
+fn saveTarga(allocator: std.mem.Allocator, path: []const u8, bgra_data: []const u8, width: u16, height: u16) !void {
+    const pixels = @as(usize, width) * @as(usize, height);
+    const tga_data = try allocator.alloc(u8, 18 + pixels * 4);
+    defer allocator.free(tga_data);
+
+    tga_data[0] = 0; // ID length
+    tga_data[1] = 0; // Color map type
+    tga_data[2] = 2; // Image type (uncompressed true-color)
+    @memset(tga_data[3..8], 0); // Color map spec (5 bytes, all 0)
+
+    std.mem.writeInt(u16, tga_data[8..10], 0, .little); // X-origin
+    std.mem.writeInt(u16, tga_data[10..12], 0, .little); // Y-origin
+    std.mem.writeInt(u16, tga_data[12..14], width, .little); // Width
+    std.mem.writeInt(u16, tga_data[14..16], height, .little); // Height
+
+    tga_data[16] = 32; // Pixel depth
+    tga_data[17] = 8; // Image descriptor (alpha depth 8)
+
+    var offset: usize = 18;
+    for (0..height) |i| {
+        const row_start = (height - 1 - i) * width * 4;
+        @memcpy(tga_data[offset .. offset + width * 4], bgra_data[row_start .. row_start + width * 4]);
+        offset += width * 4;
+    }
+
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+    try file.writeAll(tga_data);
+}
+
+pub fn saveErrorMap(allocator: std.mem.Allocator, path: []const u8, error_map: []const u32, width: u16, height: u16) !void {
+    const pixels = @as(usize, width) * @as(usize, height);
+    if (hasExtension(path, ".tga")) {
+        // Convert to BGRA for TGA
+        const bgra_data = try allocator.alloc(u8, pixels * 4);
+        defer allocator.free(bgra_data);
+        for (0..pixels) |i| {
+            const color = error_map[i];
+            bgra_data[i * 4 + 0] = @intCast((color >> 16) & 0xFF); // B
+            bgra_data[i * 4 + 1] = @intCast((color >> 8) & 0xFF); // G
+            bgra_data[i * 4 + 2] = @intCast((color >> 0) & 0xFF); // R
+            bgra_data[i * 4 + 3] = @intCast((color >> 24) & 0xFF); // A
+        }
+        try saveTarga(allocator, path, bgra_data, width, height);
+    } else {
+        // Convert to RGBA for PNG
+        const rgba_data = try allocator.alloc(u8, pixels * 4);
+        defer allocator.free(rgba_data);
+        for (0..pixels) |i| {
+            const color = error_map[i];
+            rgba_data[i * 4 + 0] = @intCast((color >> 0) & 0xFF); // R
+            rgba_data[i * 4 + 1] = @intCast((color >> 8) & 0xFF); // G
+            rgba_data[i * 4 + 2] = @intCast((color >> 16) & 0xFF); // B
+            rgba_data[i * 4 + 3] = @intCast((color >> 24) & 0xFF); // A
+        }
+        try savePNG(path, rgba_data, width, height);
+    }
+}
