@@ -98,7 +98,17 @@ Compilation requires:
 - [libwebp](https://chromium.googlesource.com/webm/libwebp)
 - [libavif](https://github.com/AOMediaCodec/libavif)
 
-Run `zig build --release=fast`, and the binary will emit to `zig-out/bin/ssimu2`. The library will emit to `zig-out/lib/libssimu2.so` (or .dylib on macOS, .dll on Windows) and the include will be moved to `zig-out/include/ssimu2.h`.
+Build locally:
+```sh
+zig build --release=fast
+```
+
+The binary will emit to `zig-out/bin/ssimu2`. The library will emit to `zig-out/lib/libssimu2.so` (or `.dylib` on macOS, `.dll` on Windows) and the include will be copied to `zig-out/include/ssimu2.h`.
+
+Build and install to `/usr/local/`
+```sh
+zig build --release=fast --prefix /usr/local
+```
 
 ## C ABI
 
