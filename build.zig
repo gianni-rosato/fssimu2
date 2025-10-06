@@ -48,9 +48,9 @@ pub fn build(b: *std.Build) void {
     spng.addCSourceFiles(.{ .files = &spng_sources });
     spng.addIncludePath(b.path("third-party/"));
 
-    // ssimu2
+    // fssimu2 binary
     const bin = b.addExecutable(.{
-        .name = "ssimu2",
+        .name = "fssimu2",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -70,7 +70,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(bin);
 
-    // c lib
+    // ssimu2 lib
     const lib = b.addLibrary(.{
         .name = "ssimu2",
         .linkage = .dynamic,

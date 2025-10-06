@@ -21,7 +21,7 @@ sRGB PNG, PAM, JPEG, WebP, or AVIF input expected
 
 Example output:
 ```sh
-$ ./ssimu2 ref.png dst.png
+$ ./fssimu2 ref.png dst.png
 79.83781132
 ```
 
@@ -30,7 +30,7 @@ $ ./ssimu2 ref.png dst.png
 Performance tested on the Intel Core i7 13700k using a 3840x2160 test image. The numbers indicate that this implementation is up to 23% faster and uses ~40% less memory compared to the [reference implementation](https://github.com/cloudinary/ssimulacra2).
 
 ```
-poop "ssimulacra2 medium.png dst.png" "./ssimu2 medium.png dst.png"
+poop "ssimulacra2 medium.png dst.png" "./fssimu2 medium.png dst.png"
 Benchmark 1 (7 runs): ssimulacra2 medium.png dst.png
   measurement          mean ± σ            min … max           outliers         delta
   wall_time           809ms ± 46.8ms     760ms …  857ms          0 ( 0%)        0%
@@ -40,7 +40,7 @@ Benchmark 1 (7 runs): ssimulacra2 medium.png dst.png
   cache_references    118M  ± 1.33M      116M  …  119M           0 ( 0%)        0%
   cache_misses       60.0M  ± 3.00M     57.0M  … 63.4M           0 ( 0%)        0%
   branch_misses      16.6M  ±  101K     16.5M  … 16.8M           0 ( 0%)        0%
-Benchmark 2 (9 runs): ./ssimu2 medium.png dst.png
+Benchmark 2 (9 runs): ./fssimu2 medium.png dst.png
   measurement          mean ± σ            min … max           outliers         delta
   wall_time           618ms ± 10.4ms     603ms …  631ms          0 ( 0%)        ⚡- 23.6% ±  4.2%
   peak_rss            817MB ±  118KB     816MB …  817MB          0 ( 0%)        ⚡- 39.1% ±  0.1%
@@ -51,12 +51,12 @@ Benchmark 2 (9 runs): ./ssimu2 medium.png dst.png
   branch_misses      11.4M  ±  138K     11.0M  … 11.5M           1 (11%)        ⚡- 31.2% ±  0.8%
 ```
 
-Conformance to the reference SSIMULACRA2 implementation can be tested with `validate.py` by supplying the `ssimu2` binary.
+Conformance to the reference SSIMULACRA2 implementation can be tested with `validate.py` by supplying the `fssimu2` binary.
 
 `validate.py` requires [`uv`](https://docs.astral.sh/uv/) and [`libjxl`](https://github.com/libjxl/libjxl).
 
 ```sh
-validate.py --custom ~/git-cloning/fssimu2/zig-out/bin/ssimu2 ~/git-cloning/gb82-image-set/png/*
+validate.py --custom ~/git-cloning/fssimu2/zig-out/bin/fssimu2 ~/git-cloning/gb82-image-set/png/*
 ```
 
 Output on the [gb82 image set](https://github.com/gianni-rosato/gb82-image-set) invoking the above command:
@@ -82,11 +82,11 @@ LEVELS: 1.0 2.0 4.0
 
 ## Error Map
 
-The `ssimu2` binary optionally allows specifying an error map output image as either an uncompressed `.tga` (Targa) or PNG.
+The `fssimu2` binary optionally allows specifying an error map output image as either an uncompressed `.tga` (Targa) or PNG.
 
 Error maps use the [Turbo](https://research.google/blog/turbo-an-improved-rainbow-colormap-for-visualization/) color map for error visualization, which emphasizes visually obvious errors well.
 
-An example output is provided here, generated using `./ssimu2 --err-map map.png ref.png dst_bad.png` which resulted in a score of `49.37005220`.
+An example output is provided here, generated using `./fssimu2 --err-map map.png ref.png dst_bad.png` which resulted in a score of `49.37005220`.
 
 ![Sample Error Map](./map.webp)
 
@@ -103,7 +103,7 @@ Build locally:
 zig build --release=fast
 ```
 
-The binary will emit to `zig-out/bin/ssimu2`. The library will emit to `zig-out/lib/libssimu2.so` (or `.dylib` on macOS, `.dll` on Windows) and the include will be copied to `zig-out/include/ssimu2.h`.
+The binary will emit to `zig-out/bin/fssimu2`. The library will emit to `zig-out/lib/libssimu2.so` (or `.dylib` on macOS, `.dll` on Windows) and the include will be copied to `zig-out/include/ssimu2.h`.
 
 Build and install to `/usr/local/`
 ```sh
