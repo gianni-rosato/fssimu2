@@ -24,6 +24,12 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", version);
     const strip: bool = if (optimize == std.builtin.OptimizeMode.ReleaseFast) true else false;
 
+    _ = b.addModule("fssimu2", .{
+        .root_source_file = b.path("src/ssimulacra2.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // libspng
     const spng = b.addLibrary(.{
         .name = "spng",
