@@ -110,11 +110,64 @@ Build and install to `/usr/local/`
 zig build --release=fast --prefix /usr/local
 ```
 
-## C ABI
+## Library Usage
 
-`fssimu2` provides a C-compatible ABI with the `ssimu2.h` include file.
+`fssimu2` provides a C-compatible ABI with the `ssimu2.h` include file, as well as a Zig package for use with Zig's dependency management system.
 
-### Header
+### Zig
+
+Adding the `fssimu2` dependency allows your Zig project to make use of the public `computeSsimu2()` in `ssimulacra2.zig`.
+
+```zig
+pub fn computeSsimu2(
+    allocator: std.mem.Allocator,
+    reference: []const u8,
+    distorted: []const u8,
+    width: u32,
+    height: u32,
+    channels: u32,
+    error_map: ?[]u32,
+) Ssimu2Error!f64 {
+...
+```
+
+In order to add it to your project, follow the steps below.
+
+1. Run one of the following commands:
+    ```sh
+    # Pull from latest `main`
+    zig fetch --save https://github.com/gianni-rosato/fssimu2/archive/refs/heads/main.tar.gz
+    # Pull from a specific tag
+    zig fetch --save https://github.com/gianni-rosato/fssimu2/archive/refs/tags/0.1.1.tar.gz
+    ```
+
+2. Add these lines somewhere in the `build()` function in `build.zig` to expose the module to the build system:
+   ```zig
+   const fssimu2 = b.dependency("fssimu2", .{
+       .target = target,
+       .optimize = optimize,
+   });
+   ```
+
+3. Link the module to your library or binary:
+   ```zig
+   bin.root_module.addImport("fssimu2", fssimu2.module("fssimu2"));
+   bin.linkLibrary(fssimu2.artifact("ssimu2"));
+   // ^ Put these before `b.installArtifact(bin);`
+   ```
+
+Now, you can import the SSIMULACRA2 computation like so:
+```zig
+const fssimu2 = @import("fssimu2");
+```
+
+### C
+
+Once you've compiled and installed `fssimu2`, include the header in any relevant file to get started:
+
+```c
+#include <ssimu2.h>
+```
 
 The exposed functionality is as follows:
 
@@ -132,6 +185,8 @@ int ssimulacra2_score(
     const double *out_score
 );
 ```
+
+Builds will require `-lssimu2` passed to the compiler.
 
 ### Example Usage
 
