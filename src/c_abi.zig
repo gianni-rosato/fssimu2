@@ -39,3 +39,40 @@ export fn ssimulacra2_score(
         error.OutOfMemory => SSIMU2_OUT_OF_MEMORY,
     };
 }
+
+export fn ssimulacra2_score_with_map(
+    reference: [*]const u8,
+    distorted: [*]const u8,
+    width: c_uint,
+    height: c_uint,
+    channels: c_uint,
+    out_score: *f64,
+    error_map: [*]u32,
+) callconv(.c) c_int {
+    const gpa = std.heap.c_allocator;
+
+    const pixels: usize = @intCast(width * height);
+    const expected_len = pixels * @as(usize, channels);
+
+    const ref_slice = reference[0..expected_len];
+    const dist_slice = distorted[0..expected_len];
+    const map_slice = error_map[0..(pixels)];
+
+    const result = ssimu2.computeSsimu2(
+        gpa,
+        ref_slice,
+        dist_slice,
+        @intCast(width),
+        @intCast(height),
+        @intCast(channels),
+        map_slice,
+    );
+
+    if (result) |val| {
+        out_score.* = val;
+        return SSIMU2_OK;
+    } else |err| return switch (err) {
+        error.InvalidChannelCount => SSIMU2_INVALID_CHANNELS,
+        error.OutOfMemory => SSIMU2_OUT_OF_MEMORY,
+    };
+}

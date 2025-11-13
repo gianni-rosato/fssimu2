@@ -21,7 +21,22 @@ int ssimulacra2_score(
     const unsigned width,
     const unsigned height,
     const unsigned channels,
-    const double *out_score
+    double *out_score
+);
+
+// Compute a SSIMULACRA2 score with distortion map
+// The caller must ensure that the reference and distorted buffers
+// are at least (width * height * channels) bytes long.
+// The error_map buffer must be at least (width * height * 4) bytes long
+// and will be filled with RGBA values representing the distortion map.
+int ssimulacra2_score_with_map(
+    const uint8_t *reference,
+    const uint8_t *distorted,
+    const unsigned width,
+    const unsigned height,
+    const unsigned channels,
+    double *out_score,
+    uint32_t *error_map
 );
 
 #ifdef __cplusplus

@@ -82,7 +82,7 @@ LEVELS: 1.0 2.0 4.0
 
 ## Error Map
 
-The `fssimu2` binary optionally allows specifying an error map output image as either an uncompressed `.tga` (Targa) or PNG.
+The library optionally allows specifying an error map output image as either an uncompressed `.tga` (Targa) or PNG.
 
 Error maps use the [Turbo](https://research.google/blog/turbo-an-improved-rainbow-colormap-for-visualization/) color map for error visualization, which emphasizes visually obvious errors well.
 
@@ -182,7 +182,22 @@ int ssimulacra2_score(
     const unsigned width,
     const unsigned height,
     const unsigned channels,
-    const double *out_score
+    double *out_score
+);
+
+// Compute a SSIMULACRA2 score with distortion map
+// The caller must ensure that the reference and distorted buffers
+// are at least (width * height * channels) bytes long.
+// The error_map buffer must be at least (width * height * 4) bytes long
+// and will be filled with RGBA values representing the distortion map.
+int ssimulacra2_score_with_map(
+    const uint8_t *reference,
+    const uint8_t *distorted,
+    const unsigned width,
+    const unsigned height,
+    const unsigned channels,
+    double *out_score,
+    uint32_t *error_map
 );
 ```
 
@@ -199,6 +214,15 @@ cc test.c pam_dec.c -I../zig-out/include -L../zig-out/lib -lssimu2 -o test
 LD_LIBRARY_PATH=../zig-out/lib ./test ref.pam dst.pam
 # Set library path for macOS
 DYLD_LIBRARY_PATH=../zig-out/lib ./test ref.pam dst.pam
+```
+
+For the error map example, enter the `c_abi_example/` dir and run:
+```sh
+cc test_with_map.c pam_dec.c -I../zig-out/include -L../zig-out/lib -lssimu2 -o test_map
+# Set library path for Linux
+LD_LIBRARY_PATH=../zig-out/lib ./test_map ref.pam dst.pam
+# Set library path for macOS
+DYLD_LIBRARY_PATH=../zig-out/lib ./test_map ref.pam dst.pam
 ```
 
 When fssimu2 is properly installed system-wide, the library path specifier isn't needed.
