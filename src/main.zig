@@ -102,18 +102,160 @@ pub fn main() !void {
         const h: usize = ref_dec.header.height;
         const frame_bytes_rgb: usize = w * h * 3;
 
-        var ref_frames: std.ArrayList([]u8) = .empty;
-        defer {
-            for (ref_frames.items) |buf| allocator.free(buf);
-            ref_frames.deinit(allocator);
-        }
-        var dist_frames: std.ArrayList([]u8) = .empty;
-        defer {
-            for (dist_frames.items) |buf| allocator.free(buf);
-            dist_frames.deinit(allocator);
+        const QueueSlot = struct {
+            ref_rgb: ?[]u8 = null,
+            dist_rgb: ?[]u8 = null,
+            index: usize = 0,
+            is_end: bool = false,
+        };
+
+        const VideoQueue = struct {
+            const Self = @This();
+
+            allocator: std.mem.Allocator,
+            mutex: std.Thread.Mutex = .{},
+            not_empty: std.Thread.Condition = .{},
+            not_full: std.Thread.Condition = .{},
+
+            buf: []QueueSlot,
+            head: usize = 0,
+            tail: usize = 0,
+            count: usize = 0,
+
+            end_pushed: bool = false,
+            seen_end: bool = false,
+
+            pub fn init(allocator_: std.mem.Allocator, capacity: usize) !Self {
+                const q: Self = .{
+                    .allocator = allocator_,
+                    .buf = try allocator_.alloc(QueueSlot, capacity),
+                };
+                @memset(q.buf, .{});
+                return q;
+            }
+
+            pub fn deinit(self: *Self) void {
+                for (self.buf) |slot| {
+                    if (slot.ref_rgb) |p| self.allocator.free(p);
+                    if (slot.dist_rgb) |p| self.allocator.free(p);
+                }
+                self.allocator.free(self.buf);
+                self.* = undefined;
+            }
+
+            pub fn push(self: *Self, slot_in: QueueSlot) void {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                while (self.count == self.buf.len) {
+                    self.not_full.wait(&self.mutex);
+                }
+
+                self.buf[self.tail] = slot_in;
+                self.tail = (self.tail + 1) % self.buf.len;
+                self.count += 1;
+
+                if (slot_in.is_end) self.end_pushed = true;
+
+                self.not_empty.signal();
+            }
+
+            pub fn pop(self: *Self) ?QueueSlot {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                while (self.count == 0) {
+                    if (self.seen_end) return null;
+                    self.not_empty.wait(&self.mutex);
+                }
+
+                const slot = self.buf[self.head];
+                self.buf[self.head] = .{};
+                self.head = (self.head + 1) % self.buf.len;
+                self.count -= 1;
+
+                if (slot.is_end) {
+                    self.seen_end = true;
+                    self.not_empty.broadcast();
+                }
+
+                self.not_full.signal();
+                return slot;
+            }
+        };
+
+        const WorkerCtx = struct {
+            allocator: std.mem.Allocator,
+            queue: *VideoQueue,
+            scores: *std.ArrayList(f64),
+            scores_mutex: *std.Thread.Mutex,
+            width: u32,
+            height: u32,
+            progress: *std.atomic.Value(usize),
+
+            pub fn worker(ctx: *@This()) !void {
+                while (true) {
+                    const slot_opt = ctx.queue.pop();
+                    if (slot_opt == null) break;
+
+                    const slot = slot_opt.?;
+                    if (slot.is_end) break;
+
+                    const ref_rgb = slot.ref_rgb.?;
+                    const dist_rgb = slot.dist_rgb.?;
+
+                    const score = try ssim.computeSsimu2(
+                        ctx.allocator,
+                        ref_rgb,
+                        dist_rgb,
+                        ctx.width,
+                        ctx.height,
+                        3,
+                        null,
+                    );
+
+                    ctx.allocator.free(ref_rgb);
+                    ctx.allocator.free(dist_rgb);
+
+                    ctx.scores_mutex.lock();
+                    try ctx.scores.append(ctx.allocator, score);
+                    ctx.scores_mutex.unlock();
+
+                    _ = ctx.progress.fetchAdd(1, .monotonic);
+                }
+            }
+        };
+
+        const queue_capacity: usize = @max(2, thread_count * 2);
+
+        var queue = try VideoQueue.init(allocator, queue_capacity);
+        defer queue.deinit();
+
+        var scores_list: std.ArrayList(f64) = .empty;
+        defer scores_list.deinit(allocator);
+
+        var scores_mutex: std.Thread.Mutex = .{};
+        var progress = std.atomic.Value(usize).init(0);
+
+        const spawn_count: usize = if (thread_count > 1) thread_count - 1 else 0;
+        var threads = try allocator.alloc(std.Thread, spawn_count);
+        defer allocator.free(threads);
+
+        var ctx = WorkerCtx{
+            .allocator = allocator,
+            .queue = &queue,
+            .scores = &scores_list,
+            .scores_mutex = &scores_mutex,
+            .width = @intCast(w),
+            .height = @intCast(h),
+            .progress = &progress,
+        };
+
+        for (0..spawn_count) |ti| {
+            threads[ti] = try std.Thread.spawn(.{}, WorkerCtx.worker, .{&ctx});
         }
 
-        var load_idx: usize = 0;
+        var produced: usize = 0;
         while (true) {
             const ref_opt = try ref_dec.readFrame();
             const dist_opt = try dist_dec.readFrame();
@@ -131,6 +273,7 @@ pub fn main() !void {
                 return fail("Failed to convert reference frame to RGB: {s}", .{@errorName(e)}, 3);
             };
             errdefer allocator.free(ref_rgb);
+
             const dist_rgb = io.yuv420ToRGB8(allocator, dist_frame.width, dist_frame.height, dist_frame.y, dist_frame.u, dist_frame.v, @intFromEnum(dist_frame.bit_depth)) catch |e| {
                 allocator.free(ref_rgb);
                 return fail("Failed to convert distorted frame to RGB: {s}", .{@errorName(e)}, 3);
@@ -143,78 +286,34 @@ pub fn main() !void {
                 return fail("Unexpected RGB buffer size while decoding video frames", .{}, 3);
             }
 
-            try ref_frames.append(allocator, ref_rgb);
-            try dist_frames.append(allocator, dist_rgb);
+            queue.push(.{
+                .ref_rgb = ref_rgb,
+                .dist_rgb = dist_rgb,
+                .index = produced,
+                .is_end = false,
+            });
 
-            load_idx += 1;
-            if (!json_output)
-                print("\rLoaded frame {d}...", .{load_idx});
-        }
-        if (!json_output and load_idx > 0)
-            print("\r" ++ " " ** 40 ++ "\r", .{});
+            produced += 1;
 
-        if (ref_frames.items.len == 0) return fail("No frames found in input videos", .{}, 2);
-
-        const scores = try allocator.alloc(f64, ref_frames.items.len);
-        defer allocator.free(scores);
-
-        const Task = struct {
-            allocator: std.mem.Allocator,
-            ref_frames: [][]u8,
-            dist_frames: [][]u8,
-            scores: []f64,
-            width: u32,
-            height: u32,
-            next_index: *std.atomic.Value(usize),
-
-            pub fn worker(self: *@This()) !void {
-                while (true) {
-                    const idx = self.next_index.fetchAdd(1, .monotonic);
-                    if (idx >= self.scores.len) break;
-
-                    const score = try ssim.computeSsimu2(
-                        self.allocator,
-                        self.ref_frames[idx],
-                        self.dist_frames[idx],
-                        self.width,
-                        self.height,
-                        3,
-                        null,
-                    );
-                    self.scores[idx] = score;
-                }
+            if (!json_output) {
+                const done = progress.load(.monotonic);
+                print("\rFrames processed: {d} (queued/produced: {d})...", .{ done, produced });
             }
-        };
+        }
 
-        var next_index = std.atomic.Value(usize).init(0);
-        var task = Task{
-            .allocator = allocator,
-            .ref_frames = ref_frames.items,
-            .dist_frames = dist_frames.items,
-            .scores = scores,
-            .width = @intCast(w),
-            .height = @intCast(h),
-            .next_index = &next_index,
-        };
+        queue.push(.{ .is_end = true });
 
-        const spawn_count: usize = if (thread_count > 1) thread_count - 1 else 0;
-        var threads = try allocator.alloc(std.Thread, spawn_count);
-        defer allocator.free(threads);
-
-        for (0..spawn_count) |ti|
-            threads[ti] = try std.Thread.spawn(.{}, Task.worker, .{&task});
-
-        task.worker() catch |e| {
+        WorkerCtx.worker(&ctx) catch |e| {
             for (threads) |t| t.join();
             return fail("SSIMULACRA2 computation failed: {s}", .{@errorName(e)}, 3);
         };
 
         for (threads) |t| t.join();
 
-        var scores_list: std.ArrayList(f64) = .empty;
-        defer scores_list.deinit(allocator);
-        try scores_list.ensureTotalCapacity(allocator, scores.len);
-        for (scores) |s| try scores_list.append(allocator, s);
+        if (!json_output and produced > 0)
+            print("\r" ++ " " ** 60 ++ "\r", .{});
+
+        if (scores_list.items.len == 0) return fail("No frames found in input videos", .{}, 2);
 
         const stats = computeStats(scores_list.items);
 
