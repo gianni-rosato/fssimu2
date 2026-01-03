@@ -329,7 +329,7 @@ pub fn loadImage(allocator: std.mem.Allocator, path: []const u8) !Image {
     }
 }
 
-fn hasExtension(path: []const u8, ext: []const u8) bool {
+pub fn hasExtension(path: []const u8, ext: []const u8) bool {
     if (path.len < ext.len) return false;
     const tail = path[path.len - ext.len ..];
     return std.ascii.eqlIgnoreCase(tail, ext);
@@ -373,6 +373,54 @@ pub fn toRGB8(allocator: std.mem.Allocator, img: Image) ![]u8 {
             }
         },
         else => return error.UnsupportedChannelCount,
+    }
+    return rgb;
+}
+
+pub fn yuv420ToRGB8(allocator: std.mem.Allocator, width: usize, height: usize, y: []const u8, u: []const u8, v: []const u8, bit_depth: u8) ![]u8 {
+    const pixels = width * height;
+    const rgb = try allocator.alloc(u8, pixels * 3);
+
+    const y_ptr = y.ptr;
+    const u_ptr = u.ptr;
+    const v_ptr = v.ptr;
+
+    for (0..height) |j| {
+        for (0..width) |i| {
+            const y_idx = j * width + i;
+            const uv_idx = (j / 2) * (width / 2) + (i / 2);
+
+            var py: f32 = undefined;
+            var pu: f32 = undefined;
+            var pv: f32 = undefined;
+
+            if (bit_depth == 8) {
+                py = @floatFromInt(y[y_idx]);
+                pu = @floatFromInt(u[uv_idx]);
+                pv = @floatFromInt(v[uv_idx]);
+            } else {
+                const y_u16 = @as(*align(1) const u16, @ptrCast(y_ptr + y_idx * 2)).*;
+                const u_u16 = @as(*align(1) const u16, @ptrCast(u_ptr + uv_idx * 2)).*;
+                const v_u16 = @as(*align(1) const u16, @ptrCast(v_ptr + uv_idx * 2)).*;
+                // Scale 10-bit to 8-bit range for the formula
+                py = @as(f32, @floatFromInt(y_u16)) / 4.0;
+                pu = @as(f32, @floatFromInt(u_u16)) / 4.0;
+                pv = @as(f32, @floatFromInt(v_u16)) / 4.0;
+            }
+
+            // BT.709 YUV to RGB conversion (limited range)
+            const y_f = (py - 16.0) / 219.0;
+            const u_f = (pu - 128.0) / 224.0;
+            const v_f = (pv - 128.0) / 224.0;
+
+            const r = y_f + 1.5748 * v_f;
+            const g = y_f - 0.1873 * u_f - 0.4681 * v_f;
+            const b = y_f + 1.8556 * u_f;
+
+            rgb[y_idx * 3 + 0] = @intFromFloat(std.math.clamp(r * 255.0, 0, 255));
+            rgb[y_idx * 3 + 1] = @intFromFloat(std.math.clamp(g * 255.0, 0, 255));
+            rgb[y_idx * 3 + 2] = @intFromFloat(std.math.clamp(b * 255.0, 0, 255));
+        }
     }
     return rgb;
 }
