@@ -26,6 +26,7 @@ pub fn main() !void {
 
     var json_output = false;
     var error_map_path: ?[]const u8 = null;
+    var thread_count_opt: ?usize = null;
     var positional: [2]?[]const u8 = .{ null, null };
     var pos_index: usize = 0;
 
@@ -47,6 +48,16 @@ pub fn main() !void {
                 return usageExtra("--err-map requires a path argument");
             }
             error_map_path = args.items[i];
+        } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-t")) {
+            i += 1;
+            if (i >= args.items.len) {
+                return usageExtra("--threads requires a positive integer argument");
+            }
+            const n = std.fmt.parseInt(usize, args.items[i], 10) catch {
+                return usageExtra("--threads must be a positive integer");
+            };
+            if (n == 0) return usageExtra("--threads must be >= 1");
+            thread_count_opt = n;
         } else {
             if (pos_index >= 2)
                 return usageExtra("Too many positional arguments provided.");
@@ -68,6 +79,12 @@ pub fn main() !void {
         if (!io.hasExtension(ref_path, ".y4m") or !io.hasExtension(dist_path, ".y4m"))
             return fail("Both inputs must be .y4m for video mode", .{}, 2);
 
+        const cpu_threads = std.Thread.getCpuCount() catch 1;
+        const thread_count: usize = blk: {
+            const t = thread_count_opt orelse cpu_threads;
+            break :blk if (t == 0) 1 else t;
+        };
+
         const ref_file = try std.fs.cwd().openFile(ref_path, .{});
         defer ref_file.close();
         const dist_file = try std.fs.cwd().openFile(dist_path, .{});
@@ -81,63 +98,141 @@ pub fn main() !void {
         if (ref_dec.header.width != dist_dec.header.width or ref_dec.header.height != dist_dec.header.height)
             return fail("Input videos must have identical dimensions (got {d}x{d} vs {d}x{d})", .{ ref_dec.header.width, ref_dec.header.height, dist_dec.header.width, dist_dec.header.height }, 2);
 
-        var scores: std.ArrayList(f64) = .empty;
-        defer scores.deinit(allocator);
+        const w: usize = ref_dec.header.width;
+        const h: usize = ref_dec.header.height;
+        const frame_bytes_rgb: usize = w * h * 3;
 
-        var frame_idx: usize = 0;
+        var ref_frames: std.ArrayList([]u8) = .empty;
+        defer {
+            for (ref_frames.items) |buf| allocator.free(buf);
+            ref_frames.deinit(allocator);
+        }
+        var dist_frames: std.ArrayList([]u8) = .empty;
+        defer {
+            for (dist_frames.items) |buf| allocator.free(buf);
+            dist_frames.deinit(allocator);
+        }
+
+        var load_idx: usize = 0;
         while (true) {
-            var ref_frame = try ref_dec.readFrame() orelse break;
+            const ref_opt = try ref_dec.readFrame();
+            const dist_opt = try dist_dec.readFrame();
+
+            if (ref_opt == null and dist_opt == null) break;
+            if (ref_opt == null or dist_opt == null)
+                return fail("Input videos have different frame counts", .{}, 2);
+
+            var ref_frame = ref_opt.?;
             defer ref_frame.deinit(allocator);
-            var dist_frame = try dist_dec.readFrame() orelse break;
+            var dist_frame = dist_opt.?;
             defer dist_frame.deinit(allocator);
 
             const ref_rgb = io.yuv420ToRGB8(allocator, ref_frame.width, ref_frame.height, ref_frame.y, ref_frame.u, ref_frame.v, @intFromEnum(ref_frame.bit_depth)) catch |e| {
                 return fail("Failed to convert reference frame to RGB: {s}", .{@errorName(e)}, 3);
             };
-            defer allocator.free(ref_rgb);
+            errdefer allocator.free(ref_rgb);
             const dist_rgb = io.yuv420ToRGB8(allocator, dist_frame.width, dist_frame.height, dist_frame.y, dist_frame.u, dist_frame.v, @intFromEnum(dist_frame.bit_depth)) catch |e| {
+                allocator.free(ref_rgb);
                 return fail("Failed to convert distorted frame to RGB: {s}", .{@errorName(e)}, 3);
             };
-            defer allocator.free(dist_rgb);
+            errdefer allocator.free(dist_rgb);
 
-            const score = ssim.computeSsimu2(
-                allocator,
-                ref_rgb,
-                dist_rgb,
-                @intCast(ref_frame.width),
-                @intCast(ref_frame.height),
-                3,
-                null,
-            ) catch |e| {
-                return fail("SSIMULACRA2 computation failed: {s}", .{@errorName(e)}, 3);
-            };
-            try scores.append(allocator, score);
-            frame_idx += 1;
+            if (ref_rgb.len != frame_bytes_rgb or dist_rgb.len != frame_bytes_rgb) {
+                allocator.free(ref_rgb);
+                allocator.free(dist_rgb);
+                return fail("Unexpected RGB buffer size while decoding video frames", .{}, 3);
+            }
+
+            try ref_frames.append(allocator, ref_rgb);
+            try dist_frames.append(allocator, dist_rgb);
+
+            load_idx += 1;
             if (!json_output)
-                print("\rProcessing frame {d}...", .{frame_idx});
+                print("\rLoaded frame {d}...", .{load_idx});
         }
-        if (!json_output and frame_idx > 0)
+        if (!json_output and load_idx > 0)
             print("\r" ++ " " ** 40 ++ "\r", .{});
 
-        if (scores.items.len == 0) return fail("No frames found in input videos", .{}, 2);
+        if (ref_frames.items.len == 0) return fail("No frames found in input videos", .{}, 2);
 
-        const stats = computeStats(scores.items);
+        const scores = try allocator.alloc(f64, ref_frames.items.len);
+        defer allocator.free(scores);
+
+        const Task = struct {
+            allocator: std.mem.Allocator,
+            ref_frames: [][]u8,
+            dist_frames: [][]u8,
+            scores: []f64,
+            width: u32,
+            height: u32,
+            next_index: *std.atomic.Value(usize),
+
+            pub fn worker(self: *@This()) !void {
+                while (true) {
+                    const idx = self.next_index.fetchAdd(1, .monotonic);
+                    if (idx >= self.scores.len) break;
+
+                    const score = try ssim.computeSsimu2(
+                        self.allocator,
+                        self.ref_frames[idx],
+                        self.dist_frames[idx],
+                        self.width,
+                        self.height,
+                        3,
+                        null,
+                    );
+                    self.scores[idx] = score;
+                }
+            }
+        };
+
+        var next_index = std.atomic.Value(usize).init(0);
+        var task = Task{
+            .allocator = allocator,
+            .ref_frames = ref_frames.items,
+            .dist_frames = dist_frames.items,
+            .scores = scores,
+            .width = @intCast(w),
+            .height = @intCast(h),
+            .next_index = &next_index,
+        };
+
+        const spawn_count: usize = if (thread_count > 1) thread_count - 1 else 0;
+        var threads = try allocator.alloc(std.Thread, spawn_count);
+        defer allocator.free(threads);
+
+        for (0..spawn_count) |ti|
+            threads[ti] = try std.Thread.spawn(.{}, Task.worker, .{&task});
+
+        task.worker() catch |e| {
+            for (threads) |t| t.join();
+            return fail("SSIMULACRA2 computation failed: {s}", .{@errorName(e)}, 3);
+        };
+
+        for (threads) |t| t.join();
+
+        var scores_list: std.ArrayList(f64) = .empty;
+        defer scores_list.deinit(allocator);
+        try scores_list.ensureTotalCapacity(allocator, scores.len);
+        for (scores) |s| try scores_list.append(allocator, s);
+
+        const stats = computeStats(scores_list.items);
 
         if (json_output) {
             print(
-                \\{{"metric":"SSIMULACRA2","score":{d:.8},"frames":{d},"stats":{{"stddev":{d:.8},"median":{d:.8},"p5":{d:.8},"p95":{d:.8},"min":{d:.8},"max":{d:.8}}}}}
+                \\{{"metric":"SSIMULACRA2","score":{d:.8},"frames":{d},"threads":{d},"stats":{{"stddev":{d:.8},"median":{d:.8},"p5":{d:.8},"p95":{d:.8},"min":{d:.8},"max":{d:.8}}}}}
                 \\
-            , .{ stats.avg, stats.count, stats.stddev, stats.median, stats.p5, stats.p95, stats.min, stats.max });
+            , .{ stats.avg, stats.count, thread_count, stats.stddev, stats.median, stats.p5, stats.p95, stats.min, stats.max });
         } else {
             print("{d:.8}\n", .{stats.avg});
-            print("frames: {d}\n", .{stats.count});
-            print("avg:    {d:.8}\n", .{stats.avg});
-            print("stddev: {d:.8}\n", .{stats.stddev});
-            print("median: {d:.8}\n", .{stats.median});
-            print("p5:     {d:.8}\n", .{stats.p5});
-            print("p95:    {d:.8}\n", .{stats.p95});
-            print("min:    {d:.8}\n", .{stats.min});
-            print("max:    {d:.8}\n", .{stats.max});
+            print("frames:  {d}\n", .{stats.count});
+            print("avg:     {d:.8}\n", .{stats.avg});
+            print("stddev:  {d:.8}\n", .{stats.stddev});
+            print("median:  {d:.8}\n", .{stats.median});
+            print("p5:      {d:.8}\n", .{stats.p5});
+            print("p95:     {d:.8}\n", .{stats.p95});
+            print("min:     {d:.8}\n", .{stats.min});
+            print("max:     {d:.8}\n", .{stats.max});
         }
         return;
     }
@@ -261,10 +356,11 @@ fn usage() void {
         \\  fssimu2 [options] <reference> <distorted>
         \\
         \\options:
-        \\  --json               output result as json
-        \\  --err-map <out>      save error map to .png/.tga
-        \\  -h, --help           show this help
-        \\  -v, --version        show version information
+        \\  --json                 output result as json
+        \\  --err-map <out>        save error map to .png/.tga
+        \\  -t, --threads <n>      number of worker threads for video scoring (default: CPU threads)
+        \\  -h, --help             show this help
+        \\  -v, --version          show version information
     , .{});
     print("\n\n\x1b[37msRGB PNG, PAM, JPEG, WebP, AVIF, or Y4M input expected\x1b[0m\n", .{});
 }
