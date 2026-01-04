@@ -1,0 +1,455 @@
+From 6061bf47ffeb4dd16bb48df9e871284a3100f696 Mon Sep 17 00:00:00 2001
+From: Gianni <giannirosato@proton.me>
+Date: Sat, 3 Jan 2026 23:26:18 -0500
+Subject: [PATCH] lavfi: add libssimu2 video filter using libssimu2
+
+---
+ configure                  |   4 +
+ libavfilter/Makefile       |   1 +
+ libavfilter/allfilters.c   |   1 +
+ libavfilter/vf_libssimu2.c | 373 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 379 insertions(+)
+ create mode 100644 libavfilter/vf_libssimu2.c
+
+diff --git a/configure b/configure
+index 3273ba746b..e6090e66b3 100755
+--- a/configure
++++ b/configure
+@@ -280,6 +280,7 @@ External library support:
+   --enable-libspeex        enable Speex de/encoding via libspeex [no]
+   --enable-libsrt          enable Haivision SRT protocol via libsrt [no]
+   --enable-libssh          enable SFTP protocol via libssh [no]
++  --enable-libssimu2       enable SSIMULACRA2 filter via libssimu2 [no]
+   --enable-libsvtav1       enable AV1 encoding via SVT [no]
+   --enable-libsvtjpegxs    enable JPEGXS encoding/decoding via SVT [no]
+   --enable-libtensorflow   enable TensorFlow as a DNN module backend
+@@ -2013,6 +2014,7 @@ EXTERNAL_LIBRARY_LIST="
+     libspeex
+     libsrt
+     libssh
++    libssimu2
+     libsvtav1
+     libsvtjpegxs
+     libtensorflow
+@@ -4114,6 +4116,7 @@ spp_filter_deps="gpl avcodec"
+ spp_filter_select="idctdsp fdctdsp me_cmp pixblockdsp"
+ sr_filter_deps="avformat swscale"
+ sr_filter_select="dnn"
++libssimu2_filter_deps="libssimu2"
+ stereo3d_filter_deps="gpl"
+ subtitles_filter_deps="avformat avcodec libass"
+ super2xsai_filter_deps="gpl"
+@@ -7261,6 +7264,7 @@ enabled libsmbclient      && { check_pkg_config libsmbclient smbclient libsmbcli
+ enabled libsnappy         && require libsnappy snappy-c.h snappy_compress -lsnappy -lstdc++
+ enabled libsoxr           && require libsoxr soxr.h soxr_create -lsoxr
+ enabled libssh            && require_pkg_config libssh "libssh >= 0.6.0" libssh/sftp.h sftp_init
++enabled libssimu2         && require_pkg_config libssimu2 ssimu2 ssimu2.h ssimulacra2_score
+ enabled libspeex          && require_pkg_config libspeex speex speex/speex.h speex_decoder_init
+ enabled libsrt            && require_pkg_config libsrt "srt >= 1.3.0" srt/srt.h srt_socket
+ enabled libsvtav1         && require_pkg_config libsvtav1 "SvtAv1Enc >= 0.9.0" EbSvtAv1Enc.h svt_av1_enc_init_handle
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 5f5a199a63..dd184fba8d 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -373,6 +373,7 @@ OBJS-$(CONFIG_LATENCY_FILTER)                += f_latency.o
+ OBJS-$(CONFIG_LENSCORRECTION_FILTER)         += vf_lenscorrection.o
+ OBJS-$(CONFIG_LENSFUN_FILTER)                += vf_lensfun.o
+ OBJS-$(CONFIG_LIBPLACEBO_FILTER)             += vf_libplacebo.o vulkan.o vulkan_filter.o
++OBJS-$(CONFIG_LIBSSIMU2_FILTER)              += vf_libssimu2.o framesync.o
+ OBJS-$(CONFIG_LIBVMAF_FILTER)                += vf_libvmaf.o framesync.o
+ OBJS-$(CONFIG_LIBVMAF_CUDA_FILTER)           += vf_libvmaf.o framesync.o
+ OBJS-$(CONFIG_LIMITDIFF_FILTER)              += vf_limitdiff.o framesync.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 9ea07a486d..44d12cf916 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -347,6 +347,7 @@ extern const FFFilter ff_vf_lcevc;
+ extern const FFFilter ff_vf_lenscorrection;
+ extern const FFFilter ff_vf_lensfun;
+ extern const FFFilter ff_vf_libplacebo;
++extern const FFFilter ff_vf_libssimu2;
+ extern const FFFilter ff_vf_libvmaf;
+ extern const FFFilter ff_vf_libvmaf_cuda;
+ extern const FFFilter ff_vf_limitdiff;
+diff --git a/libavfilter/vf_libssimu2.c b/libavfilter/vf_libssimu2.c
+new file mode 100644
+index 0000000000..36adede01e
+--- /dev/null
++++ b/libavfilter/vf_libssimu2.c
+@@ -0,0 +1,373 @@
++/*
++ * Copyright (c) 2025 Gianni Rosato
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Calculate the SSIMULACRA2 score between two input videos.
++ */
++
++#include <ssimu2.h>
++
++#include "libavutil/avstring.h"
++#include "libavutil/dict.h"
++#include "libavutil/intmath.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/thread.h"
++#include "avfilter.h"
++#include "filters.h"
++#include "framesync.h"
++#include "video.h"
++
++#include <float.h>
++#include <math.h>
++#include <inttypes.h>
++#include <string.h>
++
++typedef struct LIBSSIMU2Context {
++    const AVClass *class;
++    FFFrameSync fs;
++
++    int verbose;
++    int stats;
++
++    double score_sum;
++    double score_sumsq;
++    uint64_t nb_frames;
++    double min_score;
++    double max_score;
++
++    double *scores;
++    unsigned scores_alloc;
++    unsigned scores_len;
++
++    AVMutex lock;
++} LIBSSIMU2Context;
++
++typedef struct LibSsimu2Frame {
++    uint8_t *ref_buf;
++    uint8_t *dist_buf;
++    int      w;
++    int      h;
++    int      channels;
++    int      ref_linesize;
++    int      dist_linesize;
++} LibSsimu2Frame;
++
++typedef struct LibSsimu2Job {
++    LibSsimu2Frame *frames;
++    int             nb_frames;
++    double         *scores; /* nb_frames */
++    int             err;    /* first error code */
++} LibSsimu2Job;
++
++#define OFFSET(x) offsetof(LIBSSIMU2Context, x)
++#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
++
++static const AVOption libssimu2_options[] = {
++    { "stats", "Compute and log detailed summary stats (avg/min/max/stddev/median/p5/p95) on end.",
++      OFFSET(stats), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
++    { "verbose", "Print per-frame SSIMULACRA2 scores.",
++      OFFSET(verbose), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
++    { NULL }
++};
++
++FRAMESYNC_DEFINE_CLASS(libssimu2, LIBSSIMU2Context, fs);
++
++static int double_cmp_qsort(const void *ap, const void *bp)
++{
++    const double a = *(const double *)ap;
++    const double b = *(const double *)bp;
++    return (a > b) - (a < b);
++}
++
++static int do_ssimulacra(FFFrameSync *fs)
++{
++    AVFilterContext *ctx = fs->parent;
++    LIBSSIMU2Context *s = ctx->priv;
++    AVFrame *main, *ref;
++    int ret;
++
++    double score = 0.0;
++    const uint8_t *main_data, *ref_data;
++    uint8_t *main_packed = NULL;
++    uint8_t *ref_packed = NULL;
++
++    int channels;
++
++    ret = ff_framesync_dualinput_get(fs, &main, &ref);
++    if (ret < 0)
++        return ret;
++    if (ctx->is_disabled || !ref)
++        return ff_filter_frame(ctx->outputs[0], main);
++
++    switch (main->format) {
++    case AV_PIX_FMT_RGB24: channels = 3; break;
++    case AV_PIX_FMT_RGBA:  channels = 4; break;
++    case AV_PIX_FMT_GRAY8: channels = 1; break;
++    default:
++        return AVERROR(EINVAL);
++    }
++
++    /* NOTE on potential score mismatch:
++     * The reference fssimu2 CLI converts YUV420 -> RGB8 with its own conversion.
++     * Here we rely on FFmpeg's swscale conversion (via format=rgb24), which may
++     * not match exactly (matrix/range/transfer/rounding). If scores differ, the
++     * color conversion path is the most likely cause.
++     */
++
++    if (main->linesize[0] != main->width * channels) {
++        main_packed = av_malloc((size_t)main->width * main->height * channels);
++        if (!main_packed) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++        av_image_copy_plane(main_packed, main->width * channels,
++                            main->data[0], main->linesize[0],
++                            main->width * channels, main->height);
++        main_data = main_packed;
++    } else {
++        main_data = main->data[0];
++    }
++
++    if (ref->linesize[0] != ref->width * channels) {
++        ref_packed = av_malloc((size_t)ref->width * ref->height * channels);
++        if (!ref_packed) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++        av_image_copy_plane(ref_packed, ref->width * channels,
++                            ref->data[0], ref->linesize[0],
++                            ref->width * channels, ref->height);
++        ref_data = ref_packed;
++    } else {
++        ref_data = ref->data[0];
++    }
++
++    ret = ssimulacra2_score(ref_data, main_data, main->width, main->height, channels, &score);
++    if (ret != 0) {
++        av_log(ctx, AV_LOG_ERROR, "ssimulacra2_score failed\n");
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++
++    /* store score as metadata string */
++    {
++        char buf[64];
++        snprintf(buf, sizeof(buf), "%f", score);
++        av_dict_set(&main->metadata, "lavfi.ssimu2.score", buf, 0);
++    }
++
++    if (s->verbose) {
++        av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 score: %f\n", score);
++    }
++
++    /* Aggregate stats must be protected if frame-threading is enabled. */
++    ff_mutex_lock(&s->lock);
++
++    s->nb_frames++;
++    s->score_sum += score;
++    s->score_sumsq += score * score;
++    if (score < s->min_score) s->min_score = score;
++    if (score > s->max_score) s->max_score = score;
++
++    if (s->stats) {
++        if (s->scores_len == s->scores_alloc) {
++            unsigned new_alloc = s->scores_alloc ? s->scores_alloc * 2 : 1024;
++            double *tmp = av_realloc_f(s->scores, new_alloc, sizeof(*tmp));
++            if (tmp) {
++                s->scores = tmp;
++                s->scores_alloc = new_alloc;
++            } else {
++                /* keep avg/min/max/stddev, but disable percentile stats */
++                s->stats = 0;
++            }
++        }
++        if (s->stats && s->scores && s->scores_len < s->scores_alloc) {
++            s->scores[s->scores_len++] = score;
++        }
++    }
++
++    ff_mutex_unlock(&s->lock);
++
++    ret = ff_filter_frame(ctx->outputs[0], main);
++
++fail:
++    av_free(main_packed);
++    av_free(ref_packed);
++    return ret;
++}
++
++static av_cold int init(AVFilterContext *ctx)
++{
++    LIBSSIMU2Context *s = ctx->priv;
++
++    s->fs.on_event = do_ssimulacra;
++
++    s->score_sum = 0.0;
++    s->score_sumsq = 0.0;
++    s->nb_frames = 0;
++    s->min_score = DBL_MAX;
++    s->max_score = -DBL_MAX;
++
++    s->scores = NULL;
++    s->scores_alloc = 0;
++    s->scores_len = 0;
++
++    ff_mutex_init(&s->lock, NULL);
++
++    return 0;
++}
++
++static const enum AVPixelFormat pix_fmts[] = {
++    AV_PIX_FMT_RGB24,
++    AV_PIX_FMT_RGBA,
++    AV_PIX_FMT_GRAY8,
++    AV_PIX_FMT_NONE
++};
++
++static int config_input_ref(AVFilterLink *inlink)
++{
++    AVFilterContext *ctx = inlink->dst;
++    if (ctx->inputs[0]->w != ctx->inputs[1]->w ||
++        ctx->inputs[0]->h != ctx->inputs[1]->h) {
++        av_log(ctx, AV_LOG_ERROR, "Width and height of input videos must be same.\n");
++        return AVERROR(EINVAL);
++    }
++    if (ctx->inputs[0]->format != ctx->inputs[1]->format) {
++        av_log(ctx, AV_LOG_ERROR, "Inputs must be of same pixel format.\n");
++        return AVERROR(EINVAL);
++    }
++    return 0;
++}
++
++static int config_output(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    LIBSSIMU2Context *s = ctx->priv;
++    AVFilterLink *mainlink = ctx->inputs[0];
++    FilterLink *il = ff_filter_link(mainlink);
++    FilterLink *ol = ff_filter_link(outlink);
++    int ret;
++
++    ret = ff_framesync_init_dualinput(&s->fs, ctx);
++    if (ret < 0)
++        return ret;
++    outlink->w = mainlink->w;
++    outlink->h = mainlink->h;
++    outlink->time_base = mainlink->time_base;
++    outlink->sample_aspect_ratio = mainlink->sample_aspect_ratio;
++    ol->frame_rate = il->frame_rate;
++
++    if ((ret = ff_framesync_configure(&s->fs)) < 0)
++        return ret;
++
++    return 0;
++}
++
++static int activate(AVFilterContext *ctx)
++{
++    LIBSSIMU2Context *s = ctx->priv;
++    return ff_framesync_activate(&s->fs);
++}
++
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    LIBSSIMU2Context *s = ctx->priv;
++
++    ff_mutex_lock(&s->lock);
++
++    if (s->nb_frames > 0) {
++        const double avg = s->score_sum / (double)s->nb_frames;
++        const double mean_sq = s->score_sumsq / (double)s->nb_frames;
++        const double var = mean_sq - avg * avg;
++        const double stddev = var > 0.0 ? sqrt(var) : 0.0;
++
++        av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 average score: %f\n", avg);
++        av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 min score: %f\n", s->min_score);
++        av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 max score: %f\n", s->max_score);
++
++        if (s->stats && s->scores && s->scores_len == (unsigned)s->nb_frames && s->scores_len > 0) {
++            double *tmp = av_malloc_array(s->scores_len, sizeof(*tmp));
++            if (tmp) {
++                memcpy(tmp, s->scores, s->scores_len * sizeof(*tmp));
++                qsort(tmp, s->scores_len, sizeof(*tmp), double_cmp_qsort);
++
++                av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 stddev: %f\n", stddev);
++                av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 median: %f\n", tmp[s->scores_len / 2]);
++                av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 p5: %f\n", tmp[s->scores_len / 20]);
++                av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 p95: %f\n", tmp[s->scores_len * 19 / 20]);
++
++                av_free(tmp);
++            } else {
++                av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 stddev: %f\n", stddev);
++            }
++        } else {
++            av_log(ctx, AV_LOG_INFO, "SSIMULACRA2 stddev: %f\n", stddev);
++        }
++    }
++
++    av_freep(&s->scores);
++    s->scores_alloc = 0;
++    s->scores_len = 0;
++
++    ff_mutex_unlock(&s->lock);
++
++    ff_framesync_uninit(&s->fs);
++
++    ff_mutex_destroy(&s->lock);
++}
++
++static const AVFilterPad libssimu2_inputs[] = {
++    {
++        .name         = "main",
++        .type         = AVMEDIA_TYPE_VIDEO,
++    },
++    {
++        .name         = "reference",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = config_input_ref,
++    },
++};
++
++static const AVFilterPad libssimu2_outputs[] = {
++    {
++        .name          = "default",
++        .type          = AVMEDIA_TYPE_VIDEO,
++        .config_props  = config_output,
++    },
++};
++
++const FFFilter ff_vf_libssimu2 = {
++    .p.name        = "libssimu2",
++    .p.description = NULL_IF_CONFIG_SMALL("Calculate the SSIMULACRA2 score between two video streams."),
++    .p.priv_class  = &libssimu2_class,
++    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
++    .preinit       = libssimu2_framesync_preinit,
++    .init          = init,
++    .uninit        = uninit,
++    .activate      = activate,
++    .priv_size     = sizeof(LIBSSIMU2Context),
++    FILTER_INPUTS(libssimu2_inputs),
++    FILTER_OUTPUTS(libssimu2_outputs),
++    FILTER_PIXFMTS_ARRAY(pix_fmts),
++};
+-- 
+2.52.0
+
