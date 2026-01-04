@@ -16,6 +16,26 @@ fn getVersionString(b: *std.Build) ![]const u8 {
     return allocator.dupe(u8, version);
 }
 
+fn replaceAllOwned(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (true) {
+        const idx_opt = std.mem.indexOfPos(u8, haystack, i, needle);
+        if (idx_opt) |idx| {
+            try out.appendSlice(allocator, haystack[i..idx]);
+            try out.appendSlice(allocator, replacement);
+            i = idx + needle.len;
+        } else {
+            try out.appendSlice(allocator, haystack[i..]);
+            break;
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -85,4 +105,42 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     b.installFile("src/include/ssimu2.h", "include/ssimu2.h");
+
+    // pkg-config
+    const pc_contents =
+        \\prefix=@prefix@
+        \\exec_prefix=${prefix}
+        \\libdir=@libdir@
+        \\includedir=@includedir@
+        \\
+        \\Name: ssimu2
+        \\Description: Fast SSIMULACRA2 implementation
+        \\Version: @version@
+        \\URL: https://github.com/gianni-rosato/fssimu2
+        \\License: Apache-2.0
+        \\
+        \\Cflags: -I${includedir}
+        \\Libs: -L${libdir} -lssimu2
+        \\
+        \\Requires:
+        \\
+    ;
+
+    const prefix = b.install_prefix;
+    const libdir = b.fmt("{s}/lib", .{prefix});
+    const includedir = b.fmt("{s}/include", .{prefix});
+
+    const pc_1 = replaceAllOwned(b.allocator, pc_contents, "@prefix@", prefix) catch pc_contents;
+    const pc_2 = replaceAllOwned(b.allocator, pc_1, "@libdir@", libdir) catch pc_1;
+    const pc_3 = replaceAllOwned(b.allocator, pc_2, "@includedir@", includedir) catch pc_2;
+    const pc_out = replaceAllOwned(b.allocator, pc_3, "@version@", version) catch pc_3;
+
+    const write_pc = std.Build.Step.WriteFile.create(b);
+    _ = std.Build.Step.WriteFile.add(write_pc, "ssimu2.pc", pc_out);
+
+    b.installDirectory(.{
+        .source_dir = write_pc.getDirectory(),
+        .install_dir = .prefix,
+        .install_subdir = "lib/pkgconfig",
+    });
 }
