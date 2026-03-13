@@ -13,8 +13,65 @@ pub const Ssimu2Error = error{
 const K_SIZE = 9;
 const RADIUS = 4;
 
-pub fn computeSsimu2(
+pub const Workspace = struct {
     allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    stride: u32,
+    plane_size: usize,
+    planes: []f32,
+    temp: []f32,
+    scratch: []f32,
+
+    pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) !Workspace {
+        var ws: Workspace = .{
+            .allocator = allocator,
+            .width = 0,
+            .height = 0,
+            .stride = 0,
+            .plane_size = 0,
+            .planes = &[_]f32{},
+            .temp = &[_]f32{},
+            .scratch = &[_]f32{},
+        };
+        try ws.ensureCapacity(width, height);
+        return ws;
+    }
+
+    pub fn deinit(self: *Workspace) void {
+        if (self.planes.len > 0) self.allocator.free(self.planes);
+        if (self.temp.len > 0) self.allocator.free(self.temp);
+        if (self.scratch.len > 0) self.allocator.free(self.scratch);
+        self.* = undefined;
+    }
+
+    pub fn ensureCapacity(self: *Workspace, width: u32, height: u32) !void {
+        if (self.width == width and self.height == height and self.planes.len > 0) return;
+
+        if (self.planes.len > 0) self.allocator.free(self.planes);
+        if (self.temp.len > 0) self.allocator.free(self.temp);
+        if (self.scratch.len > 0) self.allocator.free(self.scratch);
+
+        const pixels = @as(usize, width) * @as(usize, height);
+        const total_floats: usize = pixels * 3 * 2;
+        const plane_alloc = try self.allocator.alignedAlloc(f32, .of(f32), total_floats);
+
+        const wh: usize = @as(usize, width) * @as(usize, height);
+        const temp_alloc = try self.allocator.alignedAlloc(f32, .of(f32), wh * 20);
+        const scratch_alloc = try self.allocator.alignedAlloc(f32, .of(f32), width);
+
+        self.width = width;
+        self.height = height;
+        self.stride = width;
+        self.plane_size = pixels;
+        self.planes = plane_alloc;
+        self.temp = temp_alloc;
+        self.scratch = scratch_alloc;
+    }
+};
+
+pub fn computeSsimu2WithWorkspace(
+    workspace: *Workspace,
     reference: []const u8,
     distorted: []const u8,
     width: u32,
@@ -30,24 +87,19 @@ pub fn computeSsimu2(
     std.debug.assert(reference.len >= expected_len);
     std.debug.assert(distorted.len >= expected_len);
 
-    const stride: u32 = width;
-
-    const plane_size: usize = pixels;
-    const total_floats: usize = plane_size * 3 * 2;
-    var planes: []f32 = try allocator.alignedAlloc(f32, .of(f32), total_floats);
-    defer allocator.free(planes);
+    try workspace.ensureCapacity(width, height);
 
     var ref_planes: [3][]f32 = undefined;
     var dist_planes: [3][]f32 = undefined;
     {
         var off: usize = 0;
         inline for (0..3) |i| {
-            ref_planes[i] = planes[off .. off + plane_size];
-            off += plane_size;
+            ref_planes[i] = workspace.planes[off .. off + workspace.plane_size];
+            off += workspace.plane_size;
         }
         inline for (0..3) |i| {
-            dist_planes[i] = planes[off .. off + plane_size];
-            off += plane_size;
+            dist_planes[i] = workspace.planes[off .. off + workspace.plane_size];
+            off += workspace.plane_size;
         }
     }
 
@@ -61,7 +113,30 @@ pub fn computeSsimu2(
         dist_planes[0], dist_planes[1], dist_planes[2],
     };
 
-    return process(allocator, ref_const, dist_const, stride, width, height, error_map);
+    return processWithScratch(
+        ref_const,
+        dist_const,
+        workspace.stride,
+        width,
+        height,
+        error_map,
+        workspace.temp,
+        workspace.scratch,
+    );
+}
+
+pub fn computeSsimu2(
+    allocator: std.mem.Allocator,
+    reference: []const u8,
+    distorted: []const u8,
+    width: u32,
+    height: u32,
+    channels: u32,
+    error_map: ?[]u32,
+) Ssimu2Error!f64 {
+    var workspace = try Workspace.init(allocator, width, height);
+    defer workspace.deinit();
+    return computeSsimu2WithWorkspace(&workspace, reference, distorted, width, height, channels, error_map);
 }
 
 inline fn multiply(src1: []const f32, src2: []const f32, dst: []f32, stride: u32, w: u32, h: u32) void {
@@ -569,13 +644,34 @@ fn process(
     const error_map_count: u32 = if (error_map != null) 2 else 0; // error_accum and error_scale
     const temp_alloc = allocator.alignedAlloc(f32, .of(f32), wh * (18 + error_map_count)) catch unreachable;
     defer allocator.free(temp_alloc);
-    var temp = temp_alloc[0..];
+    const scratch = allocator.alignedAlloc(f32, .of(f32), stride) catch unreachable;
+    defer allocator.free(scratch);
+
+    return processWithScratch(srcp1, srcp2, stride, w, h, error_map, temp_alloc, scratch);
+}
+
+fn processWithScratch(
+    srcp1: [3][]const f32,
+    srcp2: [3][]const f32,
+    stride: u32,
+    w: u32,
+    h: u32,
+    error_map: ?[]u32,
+    temp: []f32,
+    scratch: []f32,
+) f64 {
+    const wh: u32 = stride * h;
+    const error_map_count: u32 = if (error_map != null) 2 else 0; // error_accum and error_scale
+    const required: usize = @as(usize, wh) * @as(usize, 18 + error_map_count);
+    std.debug.assert(temp.len >= required);
+    std.debug.assert(scratch.len >= stride);
+    var temp_use = temp[0..required];
 
     var temp6x3: [6][3][]f32 = undefined;
     var x: u32 = 0;
     for (0..6) |i| {
         for (0..3) |ii| {
-            temp6x3[i][ii] = temp[x..(x + wh)];
+            temp6x3[i][ii] = temp_use[x..(x + wh)];
             x += wh;
         }
     }
@@ -583,9 +679,9 @@ fn process(
     var error_accum: []f32 = undefined;
     var error_scale: []f32 = undefined;
     if (error_map != null) {
-        error_accum = temp[x..(x + wh)];
+        error_accum = temp_use[x..(x + wh)];
         x += wh;
-        error_scale = temp[x..(x + wh)];
+        error_scale = temp_use[x..(x + wh)];
         x += wh;
         @memset(error_scale, 0.0);
     }
@@ -605,10 +701,6 @@ fn process(
         @memcpy(srcp1b[i], srcp1[i]);
         @memcpy(srcp2b[i], srcp2[i]);
     }
-
-    // Single scratch buffer for all blurs (width never exceeds original stride)
-    const scratch = allocator.alignedAlloc(f32, .of(f32), stride) catch unreachable;
-    defer allocator.free(scratch);
 
     var plane_avg_ssim: [6][6]f64 = undefined;
     var plane_avg_edge: [6][12]f64 = undefined;

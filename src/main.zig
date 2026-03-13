@@ -100,11 +100,9 @@ pub fn main() !void {
 
         const w: usize = ref_dec.header.width;
         const h: usize = ref_dec.header.height;
-        const frame_bytes_rgb: usize = w * h * 3;
-
         const QueueSlot = struct {
-            ref_rgb: ?[]u8 = null,
-            dist_rgb: ?[]u8 = null,
+            ref_frame: ?y4m.Frame = null,
+            dist_frame: ?y4m.Frame = null,
             index: usize = 0,
             is_end: bool = false,
         };
@@ -135,9 +133,9 @@ pub fn main() !void {
             }
 
             pub fn deinit(self: *Self) void {
-                for (self.buf) |slot| {
-                    if (slot.ref_rgb) |p| self.allocator.free(p);
-                    if (slot.dist_rgb) |p| self.allocator.free(p);
+                for (self.buf) |*slot| {
+                    if (slot.ref_frame) |*frame| frame.deinit(self.allocator);
+                    if (slot.dist_frame) |*frame| frame.deinit(self.allocator);
                 }
                 self.allocator.free(self.buf);
                 self.* = undefined;
@@ -187,11 +185,41 @@ pub fn main() !void {
         const WorkerCtx = struct {
             allocator: std.mem.Allocator,
             queue: *VideoQueue,
-            scores: *std.ArrayList(f64),
-            scores_mutex: *std.Thread.Mutex,
+            scores: []f64,
             width: u32,
             height: u32,
             progress: *std.atomic.Value(usize),
+            ref_rgb: []u8,
+            dist_rgb: []u8,
+            workspace: ssim.Workspace,
+
+            pub fn init(
+                alloc: std.mem.Allocator,
+                queue: *VideoQueue,
+                scores: []f64,
+                width: u32,
+                height: u32,
+                progress: *std.atomic.Value(usize),
+            ) !@This() {
+                const pixels = @as(usize, width) * @as(usize, height);
+                return .{
+                    .allocator = alloc,
+                    .queue = queue,
+                    .scores = scores,
+                    .width = width,
+                    .height = height,
+                    .progress = progress,
+                    .ref_rgb = try alloc.alloc(u8, pixels * 3),
+                    .dist_rgb = try alloc.alloc(u8, pixels * 3),
+                    .workspace = try ssim.Workspace.init(alloc, width, height),
+                };
+            }
+
+            pub fn deinit(ctx: *@This()) void {
+                ctx.allocator.free(ctx.ref_rgb);
+                ctx.allocator.free(ctx.dist_rgb);
+                ctx.workspace.deinit();
+            }
 
             pub fn worker(ctx: *@This()) !void {
                 while (true) {
@@ -201,32 +229,48 @@ pub fn main() !void {
                     const slot = slot_opt.?;
                     if (slot.is_end) break;
 
-                    const ref_rgb = slot.ref_rgb.?;
-                    const dist_rgb = slot.dist_rgb.?;
+                    var ref_frame = slot.ref_frame.?;
+                    defer ref_frame.deinit(ctx.allocator);
+                    var dist_frame = slot.dist_frame.?;
+                    defer dist_frame.deinit(ctx.allocator);
 
-                    const score = try ssim.computeSsimu2(
-                        ctx.allocator,
-                        ref_rgb,
-                        dist_rgb,
+                    try io.yuv420ToRGB8Into(
+                        ctx.ref_rgb,
+                        @intCast(ref_frame.width),
+                        @intCast(ref_frame.height),
+                        ref_frame.y,
+                        ref_frame.u,
+                        ref_frame.v,
+                        @intFromEnum(ref_frame.bit_depth),
+                    );
+
+                    try io.yuv420ToRGB8Into(
+                        ctx.dist_rgb,
+                        @intCast(dist_frame.width),
+                        @intCast(dist_frame.height),
+                        dist_frame.y,
+                        dist_frame.u,
+                        dist_frame.v,
+                        @intFromEnum(dist_frame.bit_depth),
+                    );
+
+                    const score = try ssim.computeSsimu2WithWorkspace(
+                        &ctx.workspace,
+                        ctx.ref_rgb,
+                        ctx.dist_rgb,
                         ctx.width,
                         ctx.height,
                         3,
                         null,
                     );
 
-                    ctx.allocator.free(ref_rgb);
-                    ctx.allocator.free(dist_rgb);
-
-                    ctx.scores_mutex.lock();
-                    try ctx.scores.append(ctx.allocator, score);
-                    ctx.scores_mutex.unlock();
-
+                    ctx.scores[slot.index] = score;
                     _ = ctx.progress.fetchAdd(1, .monotonic);
                 }
             }
         };
 
-        const queue_capacity: usize = @max(2, thread_count * 2);
+        const queue_capacity: usize = @max(32, thread_count * 4);
 
         var queue = try VideoQueue.init(allocator, queue_capacity);
         defer queue.deinit();
@@ -234,25 +278,37 @@ pub fn main() !void {
         var scores_list: std.ArrayList(f64) = .empty;
         defer scores_list.deinit(allocator);
 
-        var scores_mutex: std.Thread.Mutex = .{};
+        // Pre-allocate for common video lengths, will resize if needed
+        try scores_list.ensureTotalCapacityPrecise(allocator, 1024);
+        try scores_list.resize(allocator, 1024);
+        @memset(scores_list.items, 0.0);
+
         var progress = std.atomic.Value(usize).init(0);
 
         const spawn_count: usize = if (thread_count > 1) thread_count - 1 else 0;
         var threads = try allocator.alloc(std.Thread, spawn_count);
         defer allocator.free(threads);
 
-        var ctx = WorkerCtx{
-            .allocator = allocator,
-            .queue = &queue,
-            .scores = &scores_list,
-            .scores_mutex = &scores_mutex,
-            .width = @intCast(w),
-            .height = @intCast(h),
-            .progress = &progress,
-        };
+        var worker_ctxs = try allocator.alloc(WorkerCtx, thread_count);
+        var worker_ctxs_len: usize = 0;
+        defer {
+            for (worker_ctxs[0..worker_ctxs_len]) |*worker_ctx| worker_ctx.deinit();
+            allocator.free(worker_ctxs);
+        }
+
+        while (worker_ctxs_len < worker_ctxs.len) : (worker_ctxs_len += 1) {
+            worker_ctxs[worker_ctxs_len] = try WorkerCtx.init(
+                allocator,
+                &queue,
+                scores_list.items,
+                @intCast(w),
+                @intCast(h),
+                &progress,
+            );
+        }
 
         for (0..spawn_count) |ti| {
-            threads[ti] = try std.Thread.spawn(.{}, WorkerCtx.worker, .{&ctx});
+            threads[ti] = try std.Thread.spawn(.{}, WorkerCtx.worker, .{&worker_ctxs[ti]});
         }
 
         var produced: usize = 0;
@@ -264,31 +320,21 @@ pub fn main() !void {
             if (ref_opt == null or dist_opt == null)
                 return fail("Input videos have different frame counts", .{}, 2);
 
-            var ref_frame = ref_opt.?;
-            defer ref_frame.deinit(allocator);
-            var dist_frame = dist_opt.?;
-            defer dist_frame.deinit(allocator);
+            const ref_frame = ref_opt.?;
+            const dist_frame = dist_opt.?;
 
-            const ref_rgb = io.yuv420ToRGB8(allocator, ref_frame.width, ref_frame.height, ref_frame.y, ref_frame.u, ref_frame.v, @intFromEnum(ref_frame.bit_depth)) catch |e| {
-                return fail("Failed to convert reference frame to RGB: {s}", .{@errorName(e)}, 3);
-            };
-            errdefer allocator.free(ref_rgb);
-
-            const dist_rgb = io.yuv420ToRGB8(allocator, dist_frame.width, dist_frame.height, dist_frame.y, dist_frame.u, dist_frame.v, @intFromEnum(dist_frame.bit_depth)) catch |e| {
-                allocator.free(ref_rgb);
-                return fail("Failed to convert distorted frame to RGB: {s}", .{@errorName(e)}, 3);
-            };
-            errdefer allocator.free(dist_rgb);
-
-            if (ref_rgb.len != frame_bytes_rgb or dist_rgb.len != frame_bytes_rgb) {
-                allocator.free(ref_rgb);
-                allocator.free(dist_rgb);
-                return fail("Unexpected RGB buffer size while decoding video frames", .{}, 3);
+            if (produced >= scores_list.items.len) {
+                const old_len = scores_list.items.len;
+                const new_len = old_len * 2;
+                try scores_list.ensureTotalCapacityPrecise(allocator, new_len);
+                try scores_list.resize(allocator, new_len);
+                @memset(scores_list.items[old_len..new_len], 0.0);
+                for (worker_ctxs) |*w_ctx| w_ctx.scores = scores_list.items;
             }
 
             queue.push(.{
-                .ref_rgb = ref_rgb,
-                .dist_rgb = dist_rgb,
+                .ref_frame = ref_frame,
+                .dist_frame = dist_frame,
                 .index = produced,
                 .is_end = false,
             });
@@ -301,9 +347,11 @@ pub fn main() !void {
             }
         }
 
+        scores_list.items.len = produced;
+
         queue.push(.{ .is_end = true });
 
-        WorkerCtx.worker(&ctx) catch |e| {
+        WorkerCtx.worker(&worker_ctxs[spawn_count]) catch |e| {
             for (threads) |t| t.join();
             return fail("SSIMULACRA2 computation failed: {s}", .{@errorName(e)}, 3);
         };
