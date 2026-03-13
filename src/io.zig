@@ -380,6 +380,13 @@ pub fn toRGB8(allocator: std.mem.Allocator, img: Image) ![]u8 {
 pub fn yuv420ToRGB8(allocator: std.mem.Allocator, width: usize, height: usize, y: []const u8, u: []const u8, v: []const u8, bit_depth: u8) ![]u8 {
     const pixels = width * height;
     const rgb = try allocator.alloc(u8, pixels * 3);
+    try yuv420ToRGB8Into(rgb, width, height, y, u, v, bit_depth);
+    return rgb;
+}
+
+pub fn yuv420ToRGB8Into(dst: []u8, width: usize, height: usize, y: []const u8, u: []const u8, v: []const u8, bit_depth: u8) !void {
+    const pixels = width * height;
+    if (dst.len < pixels * 3) return error.BufferTooSmall;
 
     const y_ptr = y.ptr;
     const u_ptr = u.ptr;
@@ -417,12 +424,11 @@ pub fn yuv420ToRGB8(allocator: std.mem.Allocator, width: usize, height: usize, y
             const g = y_f - 0.1873 * u_f - 0.4681 * v_f;
             const b = y_f + 1.8556 * u_f;
 
-            rgb[y_idx * 3 + 0] = @intFromFloat(std.math.clamp(r * 255.0, 0, 255));
-            rgb[y_idx * 3 + 1] = @intFromFloat(std.math.clamp(g * 255.0, 0, 255));
-            rgb[y_idx * 3 + 2] = @intFromFloat(std.math.clamp(b * 255.0, 0, 255));
+            dst[y_idx * 3 + 0] = @intFromFloat(std.math.clamp(r * 255.0, 0, 255));
+            dst[y_idx * 3 + 1] = @intFromFloat(std.math.clamp(g * 255.0, 0, 255));
+            dst[y_idx * 3 + 2] = @intFromFloat(std.math.clamp(b * 255.0, 0, 255));
         }
     }
-    return rgb;
 }
 
 fn savePNG(path: []const u8, rgba_data: []const u8, width: u16, height: u16) !void {
