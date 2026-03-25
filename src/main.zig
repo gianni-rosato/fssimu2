@@ -221,56 +221,144 @@ pub fn main() !void {
                 ctx.workspace.deinit();
             }
 
+            fn processSlot(ctx: *@This(), slot: QueueSlot) !void {
+                if (slot.is_end) return;
+
+                var ref_frame = slot.ref_frame.?;
+                defer ref_frame.deinit(ctx.allocator);
+                var dist_frame = slot.dist_frame.?;
+                defer dist_frame.deinit(ctx.allocator);
+
+                try io.yuv420ToRGB8Into(
+                    ctx.ref_rgb,
+                    @intCast(ref_frame.width),
+                    @intCast(ref_frame.height),
+                    ref_frame.y,
+                    ref_frame.u,
+                    ref_frame.v,
+                    @intFromEnum(ref_frame.bit_depth),
+                );
+
+                try io.yuv420ToRGB8Into(
+                    ctx.dist_rgb,
+                    @intCast(dist_frame.width),
+                    @intCast(dist_frame.height),
+                    dist_frame.y,
+                    dist_frame.u,
+                    dist_frame.v,
+                    @intFromEnum(dist_frame.bit_depth),
+                );
+
+                const score = try ssim.computeSsimu2WithWorkspace(
+                    &ctx.workspace,
+                    ctx.ref_rgb,
+                    ctx.dist_rgb,
+                    ctx.width,
+                    ctx.height,
+                    3,
+                    null,
+                );
+
+                ctx.scores[slot.index] = score;
+                _ = ctx.progress.fetchAdd(1, .monotonic);
+            }
+
             pub fn worker(ctx: *@This()) !void {
                 while (true) {
                     const slot_opt = ctx.queue.pop();
                     if (slot_opt == null) break;
 
                     const slot = slot_opt.?;
-                    if (slot.is_end) break;
-
-                    var ref_frame = slot.ref_frame.?;
-                    defer ref_frame.deinit(ctx.allocator);
-                    var dist_frame = slot.dist_frame.?;
-                    defer dist_frame.deinit(ctx.allocator);
-
-                    try io.yuv420ToRGB8Into(
-                        ctx.ref_rgb,
-                        @intCast(ref_frame.width),
-                        @intCast(ref_frame.height),
-                        ref_frame.y,
-                        ref_frame.u,
-                        ref_frame.v,
-                        @intFromEnum(ref_frame.bit_depth),
-                    );
-
-                    try io.yuv420ToRGB8Into(
-                        ctx.dist_rgb,
-                        @intCast(dist_frame.width),
-                        @intCast(dist_frame.height),
-                        dist_frame.y,
-                        dist_frame.u,
-                        dist_frame.v,
-                        @intFromEnum(dist_frame.bit_depth),
-                    );
-
-                    const score = try ssim.computeSsimu2WithWorkspace(
-                        &ctx.workspace,
-                        ctx.ref_rgb,
-                        ctx.dist_rgb,
-                        ctx.width,
-                        ctx.height,
-                        3,
-                        null,
-                    );
-
-                    ctx.scores[slot.index] = score;
-                    _ = ctx.progress.fetchAdd(1, .monotonic);
+                    try ctx.processSlot(slot);
                 }
             }
         };
 
         const queue_capacity: usize = @max(32, thread_count * 4);
+
+        if (thread_count == 1) {
+            var scores_list: std.ArrayList(f64) = .empty;
+            defer scores_list.deinit(allocator);
+
+            // Pre-allocate for common video lengths, will resize if needed
+            try scores_list.ensureTotalCapacityPrecise(allocator, 1024);
+            try scores_list.resize(allocator, 1024);
+            @memset(scores_list.items, 0.0);
+
+            var progress = std.atomic.Value(usize).init(0);
+            var worker_ctx = try WorkerCtx.init(
+                allocator,
+                undefined,
+                scores_list.items,
+                @intCast(w),
+                @intCast(h),
+                &progress,
+            );
+            defer worker_ctx.deinit();
+
+            var produced: usize = 0;
+            while (true) {
+                const ref_opt = try ref_dec.readFrame();
+                const dist_opt = try dist_dec.readFrame();
+
+                if (ref_opt == null and dist_opt == null) break;
+                if (ref_opt == null or dist_opt == null)
+                    return fail("Input videos have different frame counts", .{}, 2);
+
+                const ref_frame = ref_opt.?;
+                const dist_frame = dist_opt.?;
+
+                if (produced >= scores_list.items.len) {
+                    const old_len = scores_list.items.len;
+                    const new_len = old_len * 2;
+                    try scores_list.ensureTotalCapacityPrecise(allocator, new_len);
+                    try scores_list.resize(allocator, new_len);
+                    @memset(scores_list.items[old_len..new_len], 0.0);
+                    worker_ctx.scores = scores_list.items;
+                }
+
+                try worker_ctx.processSlot(.{
+                    .ref_frame = ref_frame,
+                    .dist_frame = dist_frame,
+                    .index = produced,
+                    .is_end = false,
+                });
+
+                produced += 1;
+
+                if (!json_output) {
+                    const done = progress.load(.monotonic);
+                    print("\rFrames processed: {d} (queued/produced: {d})...", .{ done, produced });
+                }
+            }
+
+            scores_list.items.len = produced;
+
+            if (!json_output and produced > 0)
+                print("\r" ++ " " ** 60 ++ "\r", .{});
+
+            if (scores_list.items.len == 0) return fail("No frames found in input videos", .{}, 2);
+
+            const stats = computeStats(scores_list.items);
+
+            if (json_output) {
+                print(
+                    \\{{"metric":"SSIMULACRA2","score":{d:.8},"frames":{d},"threads":{d},"stats":{{"stddev":{d:.8},"median":{d:.8},"p5":{d:.8},"p95":{d:.8},"min":{d:.8},"max":{d:.8}}}}}
+                    \\
+                , .{ stats.avg, stats.count, thread_count, stats.stddev, stats.median, stats.p5, stats.p95, stats.min, stats.max });
+            } else {
+                print("{d:.8}\n", .{stats.avg});
+                print("frames:  {d}\n", .{stats.count});
+                print("avg:     {d:.8}\n", .{stats.avg});
+                print("stddev:  {d:.8}\n", .{stats.stddev});
+                print("median:  {d:.8}\n", .{stats.median});
+                print("p5:      {d:.8}\n", .{stats.p5});
+                print("p95:     {d:.8}\n", .{stats.p95});
+                print("min:     {d:.8}\n", .{stats.min});
+                print("max:     {d:.8}\n", .{stats.max});
+            }
+            return;
+        }
 
         var queue = try VideoQueue.init(allocator, queue_capacity);
         defer queue.deinit();
