@@ -24,6 +24,7 @@ pub fn main() !void {
     defer args.deinit(allocator);
     while (args_iter.next()) |a| try args.append(allocator, a);
 
+    const cpu_threads = std.Thread.getCpuCount() catch 1;
     var json_output = false;
     var error_map_path: ?[]const u8 = null;
     var thread_count_opt: ?usize = null;
@@ -56,8 +57,8 @@ pub fn main() !void {
             const n = std.fmt.parseInt(usize, args.items[i], 10) catch {
                 return usageExtra("--threads must be a positive integer");
             };
-            if (n == 0) return usageExtra("--threads must be >= 1");
             thread_count_opt = n;
+            if (n == 0) thread_count_opt = cpu_threads;
         } else {
             if (pos_index >= 2)
                 return usageExtra("Too many positional arguments provided.");
@@ -79,7 +80,6 @@ pub fn main() !void {
         if (!io.hasExtension(ref_path, ".y4m") or !io.hasExtension(dist_path, ".y4m"))
             return fail("Both inputs must be .y4m for video mode", .{}, 2);
 
-        const cpu_threads = std.Thread.getCpuCount() catch 1;
         const thread_count: usize = blk: {
             const t = thread_count_opt orelse cpu_threads;
             break :blk if (t == 0) 1 else t;
