@@ -19,7 +19,7 @@ pub const Workspace = struct {
     height: u32,
     stride: u32,
     plane_size: usize,
-    planes: []f32,
+    planes: []f16,
     temp: []f32,
     scratch: []f32,
 
@@ -30,7 +30,7 @@ pub const Workspace = struct {
             .height = 0,
             .stride = 0,
             .plane_size = 0,
-            .planes = &[_]f32{},
+            .planes = &[_]f16{},
             .temp = &[_]f32{},
             .scratch = &[_]f32{},
         };
@@ -54,7 +54,7 @@ pub const Workspace = struct {
 
         const pixels = @as(usize, width) * @as(usize, height);
         const total_floats: usize = pixels * 3 * 2;
-        const plane_alloc = try self.allocator.alignedAlloc(f32, .of(f32), total_floats);
+        const plane_alloc = try self.allocator.alignedAlloc(f16, .of(f16), total_floats);
 
         const wh: usize = @as(usize, width) * @as(usize, height);
         const temp_alloc = try self.allocator.alignedAlloc(f32, .of(f32), wh * 20);
@@ -89,8 +89,8 @@ pub fn computeSsimu2WithWorkspace(
 
     try workspace.ensureCapacity(width, height);
 
-    var ref_planes: [3][]f32 = undefined;
-    var dist_planes: [3][]f32 = undefined;
+    var ref_planes: [3][]f16 = undefined;
+    var dist_planes: [3][]f16 = undefined;
     {
         var off: usize = 0;
         inline for (0..3) |i| {
@@ -106,10 +106,10 @@ pub fn computeSsimu2WithWorkspace(
     scl.sRGBInterleavedToPlanarLinear(reference, ref_planes, width, height, channels);
     scl.sRGBInterleavedToPlanarLinear(distorted, dist_planes, width, height, channels);
 
-    const ref_const: [3][]const f32 = .{
+    const ref_const: [3][]const f16 = .{
         ref_planes[0], ref_planes[1], ref_planes[2],
     };
-    const dist_const: [3][]const f32 = .{
+    const dist_const: [3][]const f16 = .{
         dist_planes[0], dist_planes[1], dist_planes[2],
     };
 
@@ -150,7 +150,7 @@ inline fn multiply(src1: []const f32, src2: []const f32, dst: []f32, stride: u32
     }
 }
 
-fn blurH(srcp: []f32, dstp: []f32, kernel: [K_SIZE]f32, w: i32) void {
+fn blurH(srcp: []const f32, dstp: []f32, kernel: [K_SIZE]f32, w: i32) void {
     var j: i32 = 0;
     while (j < @min(w, RADIUS)) : (j += 1) {
         const dist_from_right: i32 = w - 1 - j;
@@ -202,7 +202,7 @@ inline fn blurV(src: anytype, dstp: []f32, kernel: [K_SIZE]f32, w: u32) void {
         var accum: f32 = 0.0;
         var k: u32 = 0;
         while (k < K_SIZE) : (k += 1) {
-            accum += kernel[k] * src[k][j];
+            accum += kernel[k] * @as(f32, @floatCast(src[k][j]));
         }
         dstp[j] = accum;
     }
@@ -250,15 +250,15 @@ inline fn blur(src: []const f32, dst: []f32, stride: u32, w: u32, h: u32, tmp_ro
 }
 
 const K_D0: f32 = 0.0037930734;
-const K_D1: f32 = std.math.lossyCast(f32, math.cbrt(@as(f32, K_D0)));
+const K_D1: f32 = std.math.lossyCast(f32, math.cbrt(K_D0));
 
-const V00 = 0.0;
-const V05 = 0.5;
-const V10 = 1.0;
-const V001 = 0.01;
-const V055 = 0.55;
-const V042 = 0.42;
-const V140 = 14.0;
+const V00: f32 = 0.0;
+const V05: f32 = 0.5;
+const V10: f32 = 1.0;
+const V001: f32 = 0.01;
+const V055: f32 = 0.55;
+const V042: f32 = 0.42;
+const V140: f32 = 14.0;
 
 const weight = [108]f64{
     0.0,
@@ -396,18 +396,21 @@ const OPSIN_ABSORBANCE_MATRIX = [_]f32{
     K_M10, K_M11, K_M12,
     K_M20, K_M21, K_M22,
 };
-const OPSIN_ABSORBANCE_BIAS: f32 = @as(f32, K_D0);
-const ABSORBANCE_BIAS: f32 = @as(f32, -K_D1);
+const OPSIN_ABSORBANCE_BIAS: f32 = K_D0;
+const ABSORBANCE_BIAS: f32 = -K_D1;
 
 inline fn cbrtVec(x: f32) f32 {
-    return std.math.lossyCast(f32, math.cbrt(@as(f32, x)));
+    return std.math.lossyCast(f32, math.cbrt(x));
 }
 
 inline fn opsinAbsorbance(rgb: [3]f32) [3]f32 {
     var out: [3]f32 = undefined;
-    out[0] = @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[0], rgb[0], @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[1], rgb[1], @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[2], rgb[2], OPSIN_ABSORBANCE_BIAS)));
-    out[1] = @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[3], rgb[0], @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[4], rgb[1], @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[5], rgb[2], OPSIN_ABSORBANCE_BIAS)));
-    out[2] = @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[6], rgb[0], @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[7], rgb[1], @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[8], rgb[2], OPSIN_ABSORBANCE_BIAS)));
+    const r = rgb[0];
+    const g = rgb[1];
+    const b = rgb[2];
+    out[0] = @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[0], r, @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[1], g, @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[2], b, OPSIN_ABSORBANCE_BIAS)));
+    out[1] = @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[3], r, @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[4], g, @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[5], b, OPSIN_ABSORBANCE_BIAS)));
+    out[2] = @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[6], r, @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[7], g, @mulAdd(f32, OPSIN_ABSORBANCE_MATRIX[8], b, OPSIN_ABSORBANCE_BIAS)));
     return out;
 }
 
@@ -493,15 +496,15 @@ inline fn ssimMap(
         const row = y * stride;
         var x: u32 = 0;
         while (x < w) : (x += 1) {
-            const m1: f32 = mu1[row + x];
-            const m2: f32 = mu2[row + x];
+            const m1: f32 = @floatCast(mu1[row + x]);
+            const m2: f32 = @floatCast(mu2[row + x]);
             const m11 = m1 * m1;
             const m22 = m2 * m2;
             const m12 = m1 * m2;
             const m_diff = m1 - m2;
             const num_m: f64 = @mulAdd(f32, m_diff, -m_diff, 1.0);
-            const num_s: f64 = @mulAdd(f32, (s12[row + x] - m12), 2.0, 0.0009);
-            const denom_s: f64 = (s11[row + x] - m11) + (s22[row + x] - m22) + 0.0009;
+            const num_s: f64 = @mulAdd(f32, (@as(f32, @floatCast(s12[row + x])) - m12), 2.0, 0.0009);
+            const denom_s: f64 = (@as(f32, @floatCast(s11[row + x])) - m11) + (@as(f32, @floatCast(s22[row + x])) - m22) + 0.0009;
             const d1: f64 = @max(1.0 - ((num_m * num_s) / denom_s), 0.0);
             sum1[0] += d1;
             sum1[1] += tothe4th(d1);
@@ -539,8 +542,8 @@ inline fn edgeMap(
         const row = y * stride;
         var x: u32 = 0;
         while (x < w) : (x += 1) {
-            const d1: f64 = (1.0 + @as(f64, @abs(im2[row + x] - mu2[row + x]))) /
-                (1.0 + @as(f64, @abs(im1[row + x] - mu1[row + x]))) - 1.0;
+            const d1: f64 = (1.0 + @as(f64, @abs(@as(f32, @floatCast(im2[row + x])) - @as(f32, @floatCast(mu2[row + x]))))) /
+                (1.0 + @as(f64, @abs(@as(f32, @floatCast(im1[row + x])) - @as(f32, @floatCast(mu1[row + x]))))) - 1.0;
             const artifact: f64 = @max(d1, 0.0);
             sum2[0] += artifact;
             sum2[1] += tothe4th(artifact);
@@ -633,8 +636,8 @@ inline fn downscale(src: [3][]f32, dst: [3][]f32, src_stride: u32, in_w: u32, in
 
 fn process(
     allocator: std.mem.Allocator,
-    srcp1: [3][]const f32,
-    srcp2: [3][]const f32,
+    srcp1: [3][]const f16,
+    srcp2: [3][]const f16,
     stride: u32,
     w: u32,
     h: u32,
@@ -651,8 +654,8 @@ fn process(
 }
 
 fn processWithScratch(
-    srcp1: [3][]const f32,
-    srcp2: [3][]const f32,
+    srcp1: [3][]const f16,
+    srcp2: [3][]const f16,
     stride: u32,
     w: u32,
     h: u32,
@@ -698,8 +701,10 @@ fn processWithScratch(
     const tmppmu1 = temp6x3[5][1];
 
     inline for (0..3) |i| {
-        @memcpy(srcp1b[i], srcp1[i]);
-        @memcpy(srcp2b[i], srcp2[i]);
+        for (srcp1[i], 0..) |v, j|
+            srcp1b[i][j] = @floatCast(v);
+        for (srcp2[i], 0..) |v, j|
+            srcp2b[i][j] = @floatCast(v);
     }
 
     var plane_avg_ssim: [6][6]f64 = undefined;
@@ -774,11 +779,10 @@ fn processWithScratch(
         }
 
         if (error_map != null) {
-            if (scale == 0) {
-                @memcpy(error_accum, error_scale);
-            } else if (scale < 3) {
+            if (scale == 0)
+                @memcpy(error_accum, error_scale)
+            else if (scale < 3)
                 err_map.upscaleAndAccumulate(error_scale, error_accum, stride2, w2, h2, stride, w, h);
-            }
         }
     }
 
