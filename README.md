@@ -162,7 +162,7 @@ In order to add it to your project, follow the steps below.
    # Pull from latest `main`
    zig fetch --save https://github.com/gianni-rosato/fssimu2/archive/refs/heads/main.tar.gz
    # Pull from a specific tag
-   zig fetch --save https://github.com/gianni-rosato/fssimu2/archive/refs/tags/0.1.2.tar.gz
+   zig fetch --save https://github.com/gianni-rosato/fssimu2/archive/refs/tags/0.1.3.tar.gz
    ```
 
 2. Add these lines somewhere in the `build()` function in `build.zig` to expose
