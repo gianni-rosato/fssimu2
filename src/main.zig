@@ -1,7 +1,7 @@
 const std = @import("std");
 const ssim = @import("ssimulacra2.zig");
 const io = @import("io.zig");
-const y4m = @import("y4m.zig");
+const imgio = @import("simpleimgio");
 const print = std.debug.print;
 const c = @import("c");
 
@@ -83,9 +83,9 @@ pub fn main(proc_init: std.process.Init) !void {
         const dist_file = try std.Io.Dir.cwd().openFile(proc_init.io, dist_path, .{});
         defer dist_file.close(proc_init.io);
 
-        var ref_dec = try y4m.Decoder.init(allocator, proc_init.io, ref_file);
+        var ref_dec = try imgio.Y4mDecoder.init(allocator, proc_init.io, ref_file);
         defer ref_dec.deinit();
-        var dist_dec = try y4m.Decoder.init(allocator, proc_init.io, dist_file);
+        var dist_dec = try imgio.Y4mDecoder.init(allocator, proc_init.io, dist_file);
         defer dist_dec.deinit();
 
         if (ref_dec.header.width != dist_dec.header.width or ref_dec.header.height != dist_dec.header.height)
@@ -94,8 +94,8 @@ pub fn main(proc_init: std.process.Init) !void {
         const w: usize = ref_dec.header.width;
         const h: usize = ref_dec.header.height;
         const QueueSlot = struct {
-            ref_frame: ?y4m.Frame = null,
-            dist_frame: ?y4m.Frame = null,
+            ref_frame: ?imgio.YuvFrame = null,
+            dist_frame: ?imgio.YuvFrame = null,
             index: usize = 0,
             is_end: bool = false,
         };
@@ -224,24 +224,16 @@ pub fn main(proc_init: std.process.Init) !void {
                 var dist_frame = slot.dist_frame.?;
                 defer dist_frame.deinit(ctx.allocator);
 
-                try io.yuv420ToRGB8Into(
+                try io.yuv420FrameToRGB8Into(
+                    ctx.allocator,
                     ctx.ref_rgb,
-                    @intCast(ref_frame.width),
-                    @intCast(ref_frame.height),
-                    ref_frame.y,
-                    ref_frame.u,
-                    ref_frame.v,
-                    @intFromEnum(ref_frame.bit_depth),
+                    ref_frame,
                 );
 
-                try io.yuv420ToRGB8Into(
+                try io.yuv420FrameToRGB8Into(
+                    ctx.allocator,
                     ctx.dist_rgb,
-                    @intCast(dist_frame.width),
-                    @intCast(dist_frame.height),
-                    dist_frame.y,
-                    dist_frame.u,
-                    dist_frame.v,
-                    @intFromEnum(dist_frame.bit_depth),
+                    dist_frame,
                 );
 
                 const score = try ssim.computeSsimu2WithWorkspace(
@@ -592,7 +584,7 @@ fn usage() void {
         \\  -h, --help             show this help
         \\  -v, --version          show version information
     , .{});
-    print("\n\n\x1b[37msRGB PNG, PAM, JPEG, WebP, AVIF, or Y4M input expected\x1b[0m\n", .{});
+    print("\n\n\x1b[37msRGB PNG, PNM/PAM, QOI, JPEG, WebP, AVIF, or Y4M input expected\x1b[0m\n", .{});
 }
 
 fn printVersion() void {
