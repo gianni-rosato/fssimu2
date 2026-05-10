@@ -1,10 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("third-party/libspng/spng.h");
-    @cInclude("jpeglib.h");
-    @cInclude("webp/decode.h");
-    @cInclude("avif/avif.h");
-});
+const c = @import("c");
 const print = std.debug.print;
 
 pub const Image = struct {
@@ -19,12 +14,12 @@ pub const Image = struct {
     }
 };
 
-pub fn loadJPEG(allocator: std.mem.Allocator, path: []const u8) !Image {
-    const file = try std.fs.cwd().openFile(path, .{});
+pub fn loadJPEG(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
+    const file = try std.Io.Dir.cwd().openFile(sys_io, path, .{});
 
     const file_ptr = c.fdopen(file.handle, "rb");
     if (file_ptr == null) {
-        file.close();
+        file.close(sys_io);
         return error.FailedToOpenFile;
     }
     defer _ = c.fclose(file_ptr);
@@ -79,13 +74,13 @@ pub fn loadJPEG(allocator: std.mem.Allocator, path: []const u8) !Image {
     };
 }
 
-pub fn loadPNG(allocator: std.mem.Allocator, path: []const u8) !Image {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const size = try file.getEndPos();
+pub fn loadPNG(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
+    const file = try std.Io.Dir.cwd().openFile(sys_io, path, .{});
+    defer file.close(sys_io);
+    const size = try file.length(sys_io);
     const buf = try allocator.alloc(u8, size);
     defer allocator.free(buf);
-    _ = try file.readAll(buf);
+    if (try file.readPositionalAll(sys_io, buf, 0) != buf.len) return error.UnexpectedEof;
 
     const ctx = c.spng_ctx_new(0);
     if (ctx == null) return error.FailedCreateContext;
@@ -129,26 +124,26 @@ pub fn loadPNG(allocator: std.mem.Allocator, path: []const u8) !Image {
     };
 }
 
-pub fn loadPAM(allocator: std.mem.Allocator, path: []const u8) !Image {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+pub fn loadPAM(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
+    const file = try std.Io.Dir.cwd().openFile(sys_io, path, .{});
+    defer file.close(sys_io);
 
-    const file_size = try file.getEndPos();
+    const file_size = try file.length(sys_io);
     const buf = try allocator.alloc(u8, file_size);
     defer allocator.free(buf);
-    _ = try file.readAll(buf);
+    if (try file.readPositionalAll(sys_io, buf, 0) != buf.len) return error.UnexpectedEof;
 
     if (buf.len < 3 or !std.mem.startsWith(u8, buf, "P7")) return error.NotAPamFile;
 
     // Find header end. Prefer explicit ENDHDR marker; else look for double newline.
-    const endhdr_explicit = std.mem.indexOf(u8, buf, "ENDHDR\n");
+    const endhdr_explicit = std.mem.find(u8, buf, "ENDHDR\n");
     var header_end_index: ?usize = null;
     if (endhdr_explicit) |i| {
         header_end_index = i + 7; // include terminator
     } else {
         // Look for first occurrence of "\n\n" (empty line). PAM spec mandates ENDHDR
         // but some generators may still use empty line.
-        const empty_line = std.mem.indexOf(u8, buf, "\n\n");
+        const empty_line = std.mem.find(u8, buf, "\n\n");
         if (empty_line) |i| header_end_index = i + 2;
     }
     if (header_end_index == null) return error.HeaderNotFound;
@@ -226,13 +221,13 @@ pub fn loadPAM(allocator: std.mem.Allocator, path: []const u8) !Image {
     };
 }
 
-pub fn loadWebP(allocator: std.mem.Allocator, path: []const u8) !Image {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const size = try file.getEndPos();
+pub fn loadWebP(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
+    const file = try std.Io.Dir.cwd().openFile(sys_io, path, .{});
+    defer file.close(sys_io);
+    const size = try file.length(sys_io);
     const buf = try allocator.alloc(u8, size);
     defer allocator.free(buf);
-    _ = try file.readAll(buf);
+    if (try file.readPositionalAll(sys_io, buf, 0) != buf.len) return error.UnexpectedEof;
 
     var width: c_int = 0;
     var height: c_int = 0;
@@ -253,13 +248,13 @@ pub fn loadWebP(allocator: std.mem.Allocator, path: []const u8) !Image {
     };
 }
 
-pub fn loadAVIF(allocator: std.mem.Allocator, path: []const u8) !Image {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const size = try file.getEndPos();
+pub fn loadAVIF(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
+    const file = try std.Io.Dir.cwd().openFile(sys_io, path, .{});
+    defer file.close(sys_io);
+    const size = try file.length(sys_io);
     const buf = try allocator.alloc(u8, size);
     defer allocator.free(buf);
-    _ = try file.readAll(buf);
+    if (try file.readPositionalAll(sys_io, buf, 0) != buf.len) return error.UnexpectedEof;
 
     const decoder = c.avifDecoderCreate();
     if (decoder == null) return error.AvifCreateDecoderFailed;
@@ -312,17 +307,17 @@ pub fn loadAVIF(allocator: std.mem.Allocator, path: []const u8) !Image {
     };
 }
 
-pub fn loadImage(allocator: std.mem.Allocator, path: []const u8) !Image {
+pub fn loadImage(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
     if (hasExtension(path, ".png"))
-        return loadPNG(allocator, path)
+        return loadPNG(allocator, sys_io, path)
     else if (hasExtension(path, ".pam"))
-        return loadPAM(allocator, path)
+        return loadPAM(allocator, sys_io, path)
     else if (hasExtension(path, ".jpg") or hasExtension(path, ".jpeg"))
-        return loadJPEG(allocator, path)
+        return loadJPEG(allocator, sys_io, path)
     else if (hasExtension(path, ".webp"))
-        return loadWebP(allocator, path)
+        return loadWebP(allocator, sys_io, path)
     else if (hasExtension(path, ".avif"))
-        return loadAVIF(allocator, path)
+        return loadAVIF(allocator, sys_io, path)
     else {
         print("Error: Unrecognized image format; fssimu2 supports PNG, PAM, JPG, WEBP, or AVIF\n", .{});
         return error.UnrecognizedImageFormat;
@@ -424,14 +419,14 @@ pub fn yuv420ToRGB8Into(dst: []u8, width: usize, height: usize, y: []const u8, u
             const g = y_f - 0.1873 * u_f - 0.4681 * v_f;
             const b = y_f + 1.8556 * u_f;
 
-            dst[y_idx * 3 + 0] = @intFromFloat(std.math.clamp(r * 255.0, 0, 255));
-            dst[y_idx * 3 + 1] = @intFromFloat(std.math.clamp(g * 255.0, 0, 255));
-            dst[y_idx * 3 + 2] = @intFromFloat(std.math.clamp(b * 255.0, 0, 255));
+            dst[y_idx * 3 + 0] = @trunc(std.math.clamp(r * 255.0, 0, 255));
+            dst[y_idx * 3 + 1] = @trunc(std.math.clamp(g * 255.0, 0, 255));
+            dst[y_idx * 3 + 2] = @trunc(std.math.clamp(b * 255.0, 0, 255));
         }
     }
 }
 
-fn savePNG(path: []const u8, rgba_data: []const u8, width: u16, height: u16) !void {
+fn savePNG(sys_io: std.Io, path: []const u8, rgba_data: []const u8, width: u16, height: u16) !void {
     const ctx = c.spng_ctx_new(c.SPNG_CTX_ENCODER);
     if (ctx == null) return error.FailedCreateContext;
     defer c.spng_ctx_free(ctx);
@@ -457,13 +452,13 @@ fn savePNG(path: []const u8, rgba_data: []const u8, width: u16, height: u16) !vo
     const png_buf = c.spng_get_png_buffer(ctx, &png_size, null);
     if (png_buf == null) return error.FailedGetBuffer;
 
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(sys_io, path, .{});
+    defer file.close(sys_io);
     const png_slice = @as([*]const u8, @ptrCast(png_buf))[0..png_size];
-    try file.writeAll(png_slice);
+    try file.writeStreamingAll(sys_io, png_slice);
 }
 
-fn saveTarga(allocator: std.mem.Allocator, path: []const u8, bgra_data: []const u8, width: u16, height: u16) !void {
+fn saveTarga(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8, bgra_data: []const u8, width: u16, height: u16) !void {
     const pixels = @as(usize, width) * @as(usize, height);
     const tga_data = try allocator.alloc(u8, 18 + pixels * 4);
     defer allocator.free(tga_data);
@@ -488,12 +483,12 @@ fn saveTarga(allocator: std.mem.Allocator, path: []const u8, bgra_data: []const 
         offset += width * 4;
     }
 
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(tga_data);
+    const file = try std.Io.Dir.cwd().createFile(sys_io, path, .{});
+    defer file.close(sys_io);
+    try file.writeStreamingAll(sys_io, tga_data);
 }
 
-pub fn saveErrorMap(allocator: std.mem.Allocator, path: []const u8, error_map: []const u32, width: u16, height: u16) !void {
+pub fn saveErrorMap(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8, error_map: []const u32, width: u16, height: u16) !void {
     const pixels = @as(usize, width) * @as(usize, height);
     if (hasExtension(path, ".tga")) {
         // Convert to BGRA for TGA
@@ -506,7 +501,7 @@ pub fn saveErrorMap(allocator: std.mem.Allocator, path: []const u8, error_map: [
             bgra_data[i * 4 + 2] = @intCast((color >> 0) & 0xFF); // R
             bgra_data[i * 4 + 3] = @intCast((color >> 24) & 0xFF); // A
         }
-        try saveTarga(allocator, path, bgra_data, width, height);
+        try saveTarga(allocator, sys_io, path, bgra_data, width, height);
     } else {
         // Convert to RGBA for PNG
         const rgba_data = try allocator.alloc(u8, pixels * 4);
@@ -518,6 +513,6 @@ pub fn saveErrorMap(allocator: std.mem.Allocator, path: []const u8, error_map: [
             rgba_data[i * 4 + 2] = @intCast((color >> 16) & 0xFF); // B
             rgba_data[i * 4 + 3] = @intCast((color >> 24) & 0xFF); // A
         }
-        try savePNG(path, rgba_data, width, height);
+        try savePNG(sys_io, path, rgba_data, width, height);
     }
 }
