@@ -12,7 +12,7 @@ const Color = extern union {
 };
 
 fn lerp(a: u8, b: u8, t: f32) u8 {
-    return @intFromFloat(@as(f32, @floatFromInt(a)) * (1.0 - t) + @as(f32, @floatFromInt(b)) * t);
+    return @trunc(@as(f32, @floatFromInt(a)) * (1.0 - t) + @as(f32, @floatFromInt(b)) * t);
 }
 
 fn turboColor(x: f32) Color {
@@ -40,9 +40,9 @@ fn turboColor(x: f32) Color {
 
     return Color{
         .vals = .{
-            .r = @intFromFloat(@round(r * 255.0)),
-            .g = @intFromFloat(@round(g * 255.0)),
-            .b = @intFromFloat(@round(b * 255.0)),
+            .r = @round(r * 255.0),
+            .g = @round(g * 255.0),
+            .b = @round(b * 255.0),
             .a = 0xFF,
         },
     };
@@ -75,7 +75,7 @@ pub fn generateErrorMap(error_accum: []const f32, error_map: []u32, stride: u32,
 
             ssim = 1.0 - ssim / 100.0;
 
-            const value: i32 = @intFromFloat(255.0 * @max(0.0, @min(ssim, 1.0)));
+            const value: i32 = @trunc(255.0 * @max(0.0, @min(ssim, 1.0)));
             error_map[out_row_offset + x] = TURBO_MAP[@intCast(value)];
         }
     }
@@ -91,10 +91,10 @@ inline fn bilinearSample(src: []const f32, fx: f32, fy: f32, stride: u32, w: u32
     const fx_frac = x_scaled - x_floor;
     const fy_frac = y_scaled - y_floor;
 
-    const ix0: i32 = @intFromFloat(@max(0.0, @min(x_floor, @as(f32, @floatFromInt(w - 1)))));
-    const iy0: i32 = @intFromFloat(@max(0.0, @min(y_floor, @as(f32, @floatFromInt(h - 1)))));
-    const ix1: i32 = @intFromFloat(@max(0.0, @min(x_floor + 1.0, @as(f32, @floatFromInt(w - 1)))));
-    const iy1: i32 = @intFromFloat(@max(0.0, @min(y_floor + 1.0, @as(f32, @floatFromInt(h - 1)))));
+    const ix0: i32 = @trunc(@max(0.0, @min(x_floor, @as(f32, @floatFromInt(w - 1)))));
+    const iy0: i32 = @trunc(@max(0.0, @min(y_floor, @as(f32, @floatFromInt(h - 1)))));
+    const ix1: i32 = @trunc(@max(0.0, @min(x_floor + 1.0, @as(f32, @floatFromInt(w - 1)))));
+    const iy1: i32 = @trunc(@max(0.0, @min(y_floor + 1.0, @as(f32, @floatFromInt(h - 1)))));
 
     const f00 = src[@as(usize, @intCast(iy0)) * stride + @as(usize, @intCast(ix0))];
     const f10 = src[@as(usize, @intCast(iy0)) * stride + @as(usize, @intCast(ix1))];

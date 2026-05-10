@@ -3,26 +3,27 @@ const std = @import("std");
 fn getVersionString(b: *std.Build) ![]const u8 {
     const allocator = b.allocator;
     const command = [_][]const u8{ "git", "describe", "--tags", "--always" };
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, b.graph.io, .{
         .argv = &command,
     }) catch |err| {
         std.log.warn("Failed to get git version: {s}", .{@errorName(err)});
         return "unknown";
     };
-    if (result.term.Exited != 0)
-        return "unknown";
-    const version = std.mem.trimRight(u8, result.stdout, "\r\n");
+    switch (result.term) {
+        .exited => |code| if (code != 0) return "unknown",
+        else => return "unknown",
+    }
+    const version = std.mem.trimEnd(u8, result.stdout, "\r\n");
     return allocator.dupe(u8, version);
 }
 
 fn replaceAllOwned(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var i: usize = 0;
     while (true) {
-        const idx_opt = std.mem.indexOfPos(u8, haystack, i, needle);
+        const idx_opt = std.mem.findPos(u8, haystack, i, needle);
         if (idx_opt) |idx| {
             try out.appendSlice(allocator, haystack[i..idx]);
             try out.appendSlice(allocator, replacement);
@@ -63,10 +64,20 @@ pub fn build(b: *std.Build) void {
         "third-party/libspng/spng.c",
         "third-party/libminiz/miniz.c",
     };
-    spng.linkLibC();
-    spng.linkSystemLibrary("m");
-    spng.addCSourceFiles(.{ .files = &spng_sources });
-    spng.addIncludePath(b.path("third-party/"));
+    spng.root_module.linkSystemLibrary("c", .{});
+    spng.root_module.linkSystemLibrary("m", .{});
+    spng.root_module.addCSourceFiles(.{ .files = &spng_sources });
+    spng.root_module.addIncludePath(b.path("third-party/"));
+
+    const c_headers = b.addTranslateC(.{
+        .root_source_file = b.path("src/c_imports.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_headers.addIncludePath(b.path("."));
+    c_headers.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    c_headers.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
+    const c_module = c_headers.createModule();
 
     // fssimu2 binary
     const bin = b.addExecutable(.{
@@ -78,15 +89,16 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
         }),
     });
+    bin.root_module.addImport("c", c_module);
     bin.root_module.addOptions("build_opts", options);
-    bin.addIncludePath(b.path("."));
-    bin.linkLibC();
-    bin.linkLibrary(spng);
+    bin.root_module.addIncludePath(b.path("."));
+    bin.root_module.linkSystemLibrary("c", .{});
+    bin.root_module.linkLibrary(spng);
 
     // system decoder libs
-    bin.linkSystemLibrary("jpeg");
-    bin.linkSystemLibrary("webp");
-    bin.linkSystemLibrary("avif");
+    bin.root_module.linkSystemLibrary("jpeg", .{});
+    bin.root_module.linkSystemLibrary("webp", .{});
+    bin.root_module.linkSystemLibrary("avif", .{});
 
     b.installArtifact(bin);
 
@@ -101,7 +113,7 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
         }),
     });
-    lib.linkLibC();
+    lib.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(lib);
 
     b.installFile("src/include/ssimu2.h", "include/ssimu2.h");

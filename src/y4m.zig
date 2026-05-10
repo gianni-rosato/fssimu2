@@ -74,9 +74,8 @@ pub const Header = struct {
 
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
-    file: std.fs.File,
-    reader: std.fs.File.Reader,
-    buffer: [4096]u8,
+    io: std.Io,
+    file: std.Io.File,
 
     header: Header,
     /// Bytes per frame payload (excluding "FRAME\n" line).
@@ -85,18 +84,15 @@ pub const Decoder = struct {
     /// Scratch buffer for reading header/frame lines.
     line_buf: [4096]u8,
 
-    pub fn init(allocator: std.mem.Allocator, file: std.fs.File) !Decoder {
+    pub fn init(allocator: std.mem.Allocator, sys_io: std.Io, file: std.Io.File) !Decoder {
         var d: Decoder = .{
             .allocator = allocator,
+            .io = sys_io,
             .file = file,
-            .buffer = undefined,
-            .reader = undefined,
             .header = .{ .width = 0, .height = 0 },
             .frame_bytes = 0,
             .line_buf = undefined,
         };
-
-        d.reader = file.reader(&d.buffer);
 
         try d.readStreamHeader();
         d.frame_bytes = computeFrameBytes(d.header);
@@ -135,9 +131,9 @@ pub const Decoder = struct {
         const v = try self.allocator.alloc(u8, c_bytes);
         errdefer self.allocator.free(v);
 
-        try readExact(self.file, y);
-        try readExact(self.file, u);
-        try readExact(self.file, v);
+        try readExact(self.io, self.file, y);
+        try readExact(self.io, self.file, u);
+        try readExact(self.io, self.file, v);
 
         return Frame{
             .width = w,
@@ -243,7 +239,10 @@ pub const Decoder = struct {
 
         while (true) {
             var byte_buf: [1]u8 = undefined;
-            const n = try self.file.read(&byte_buf);
+            const n = self.file.readStreaming(self.io, &.{&byte_buf}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => |e| return e,
+            };
             if (n == 0) {
                 if (index == 0) return null;
                 // EOF mid-line: treat as error (header/frame lines must end with '\n')
@@ -293,10 +292,13 @@ fn planeBytes(bit_depth: BitDepth, width: usize, height: usize) usize {
     return width * height * bytesPerSample(bit_depth);
 }
 
-fn readExact(file: std.fs.File, buf: []u8) !void {
+fn readExact(sys_io: std.Io, file: std.Io.File, buf: []u8) !void {
     var off: usize = 0;
     while (off < buf.len) {
-        const n = try file.read(buf[off..]);
+        const n = file.readStreaming(sys_io, &.{buf[off..]}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => |e| return e,
+        };
         if (n == 0) return error.UnexpectedEof;
         off += n;
     }

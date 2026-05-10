@@ -3,21 +3,14 @@ const ssim = @import("ssimulacra2.zig");
 const io = @import("io.zig");
 const y4m = @import("y4m.zig");
 const print = std.debug.print;
-const c = @cImport({
-    @cInclude("stdio.h");
-    @cInclude("jpeglib.h");
-    @cInclude("webp/decode.h");
-    @cInclude("avif/avif.h");
-});
+const c = @import("c");
 
 const VERSION = @import("build_opts").version;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(proc_init: std.process.Init) !void {
+    const allocator = proc_init.gpa;
 
-    var args_iter = try std.process.argsWithAllocator(allocator);
+    var args_iter = try std.process.Args.Iterator.initAllocator(proc_init.minimal.args, allocator);
     defer args_iter.deinit();
 
     var args: std.ArrayList([]const u8) = .empty;
@@ -85,14 +78,14 @@ pub fn main() !void {
             break :blk if (t == 0) 1 else t;
         };
 
-        const ref_file = try std.fs.cwd().openFile(ref_path, .{});
-        defer ref_file.close();
-        const dist_file = try std.fs.cwd().openFile(dist_path, .{});
-        defer dist_file.close();
+        const ref_file = try std.Io.Dir.cwd().openFile(proc_init.io, ref_path, .{});
+        defer ref_file.close(proc_init.io);
+        const dist_file = try std.Io.Dir.cwd().openFile(proc_init.io, dist_path, .{});
+        defer dist_file.close(proc_init.io);
 
-        var ref_dec = try y4m.Decoder.init(allocator, ref_file);
+        var ref_dec = try y4m.Decoder.init(allocator, proc_init.io, ref_file);
         defer ref_dec.deinit();
-        var dist_dec = try y4m.Decoder.init(allocator, dist_file);
+        var dist_dec = try y4m.Decoder.init(allocator, proc_init.io, dist_file);
         defer dist_dec.deinit();
 
         if (ref_dec.header.width != dist_dec.header.width or ref_dec.header.height != dist_dec.header.height)
@@ -111,9 +104,10 @@ pub fn main() !void {
             const Self = @This();
 
             allocator: std.mem.Allocator,
-            mutex: std.Thread.Mutex = .{},
-            not_empty: std.Thread.Condition = .{},
-            not_full: std.Thread.Condition = .{},
+            io: std.Io,
+            mutex: std.Io.Mutex = .init,
+            not_empty: std.Io.Condition = .init,
+            not_full: std.Io.Condition = .init,
 
             buf: []QueueSlot,
             head: usize = 0,
@@ -123,9 +117,10 @@ pub fn main() !void {
             end_pushed: bool = false,
             seen_end: bool = false,
 
-            pub fn init(allocator_: std.mem.Allocator, capacity: usize) !Self {
+            pub fn init(allocator_: std.mem.Allocator, sys_io: std.Io, capacity: usize) !Self {
                 const q: Self = .{
                     .allocator = allocator_,
+                    .io = sys_io,
                     .buf = try allocator_.alloc(QueueSlot, capacity),
                 };
                 @memset(q.buf, .{});
@@ -142,11 +137,11 @@ pub fn main() !void {
             }
 
             pub fn push(self: *Self, slot_in: QueueSlot) void {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
 
                 while (self.count == self.buf.len) {
-                    self.not_full.wait(&self.mutex);
+                    self.not_full.waitUncancelable(self.io, &self.mutex);
                 }
 
                 self.buf[self.tail] = slot_in;
@@ -155,16 +150,16 @@ pub fn main() !void {
 
                 if (slot_in.is_end) self.end_pushed = true;
 
-                self.not_empty.signal();
+                self.not_empty.signal(self.io);
             }
 
             pub fn pop(self: *Self) ?QueueSlot {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
 
                 while (self.count == 0) {
                     if (self.seen_end) return null;
-                    self.not_empty.wait(&self.mutex);
+                    self.not_empty.waitUncancelable(self.io, &self.mutex);
                 }
 
                 const slot = self.buf[self.head];
@@ -174,10 +169,10 @@ pub fn main() !void {
 
                 if (slot.is_end) {
                     self.seen_end = true;
-                    self.not_empty.broadcast();
+                    self.not_empty.broadcast(self.io);
                 }
 
-                self.not_full.signal();
+                self.not_full.signal(self.io);
                 return slot;
             }
         };
@@ -360,7 +355,7 @@ pub fn main() !void {
             return;
         }
 
-        var queue = try VideoQueue.init(allocator, queue_capacity);
+        var queue = try VideoQueue.init(allocator, proc_init.io, queue_capacity);
         defer queue.deinit();
 
         var scores_list: std.ArrayList(f64) = .empty;
@@ -472,10 +467,10 @@ pub fn main() !void {
         return;
     }
 
-    var ref_image = try io.loadImage(allocator, ref_path);
+    var ref_image = try io.loadImage(allocator, proc_init.io, ref_path);
     defer ref_image.deinit(allocator);
 
-    var dist_image = try io.loadImage(allocator, dist_path);
+    var dist_image = try io.loadImage(allocator, proc_init.io, dist_path);
     defer dist_image.deinit(allocator);
 
     // Enforce matching original dimensions
@@ -522,7 +517,7 @@ pub fn main() !void {
     // Save error map if requested
     if (error_map_path) |path| {
         if (error_map_buffer) |buf| {
-            try io.saveErrorMap(allocator, path, buf, @intCast(ref_image.width), @intCast(ref_image.height));
+            try io.saveErrorMap(allocator, proc_init.io, path, buf, @intCast(ref_image.width), @intCast(ref_image.height));
             if (!json_output) {
                 print("Error map saved to: {s}\n", .{path});
             }
