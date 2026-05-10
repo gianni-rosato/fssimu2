@@ -45,6 +45,12 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", version);
     const strip: bool = if (optimize == std.builtin.OptimizeMode.ReleaseFast) true else false;
 
+    // simpleimgio
+    const simpleimgio = b.dependency("simpleimgio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     _ = b.addModule("fssimu2", .{
         .root_source_file = b.path("src/ssimulacra2.zig"),
         .target = target,
@@ -90,6 +96,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     bin.root_module.addImport("c", c_module);
+    bin.root_module.addImport("simpleimgio", simpleimgio.module("simpleimgio"));
     bin.root_module.addOptions("build_opts", options);
     bin.root_module.addIncludePath(b.path("."));
     bin.root_module.linkSystemLibrary("c", .{});

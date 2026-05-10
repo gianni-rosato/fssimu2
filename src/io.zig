@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c");
+const imgio = @import("simpleimgio");
 const print = std.debug.print;
 
 pub const Image = struct {
@@ -124,103 +125,6 @@ pub fn loadPNG(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !
     };
 }
 
-pub fn loadPAM(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
-    const file = try std.Io.Dir.cwd().openFile(sys_io, path, .{});
-    defer file.close(sys_io);
-
-    const file_size = try file.length(sys_io);
-    const buf = try allocator.alloc(u8, file_size);
-    defer allocator.free(buf);
-    if (try file.readPositionalAll(sys_io, buf, 0) != buf.len) return error.UnexpectedEof;
-
-    if (buf.len < 3 or !std.mem.startsWith(u8, buf, "P7")) return error.NotAPamFile;
-
-    // Find header end. Prefer explicit ENDHDR marker; else look for double newline.
-    const endhdr_explicit = std.mem.find(u8, buf, "ENDHDR\n");
-    var header_end_index: ?usize = null;
-    if (endhdr_explicit) |i| {
-        header_end_index = i + 7; // include terminator
-    } else {
-        // Look for first occurrence of "\n\n" (empty line). PAM spec mandates ENDHDR
-        // but some generators may still use empty line.
-        const empty_line = std.mem.find(u8, buf, "\n\n");
-        if (empty_line) |i| header_end_index = i + 2;
-    }
-    if (header_end_index == null) return error.HeaderNotFound;
-    const header_end = header_end_index.?;
-
-    const header = buf[0..header_end];
-
-    var width: usize = 0;
-    var height: usize = 0;
-    var depth: usize = 0;
-    var maxval: usize = 0;
-    var tuple_type: []const u8 = "UNSPECIFIED";
-
-    var line_it = std.mem.tokenizeAny(u8, header, "\r\n");
-    while (line_it.next()) |line| {
-        if (line.len == 0) continue;
-        if (line[0] == '#') continue; // comment
-        if (std.mem.startsWith(u8, line, "WIDTH")) {
-            var it = std.mem.tokenizeAny(u8, line[5..], " \t");
-            if (it.next()) |v| width = try std.fmt.parseInt(usize, v, 10);
-        } else if (std.mem.startsWith(u8, line, "HEIGHT")) {
-            var it = std.mem.tokenizeAny(u8, line[6..], " \t");
-            if (it.next()) |v| height = try std.fmt.parseInt(usize, v, 10);
-        } else if (std.mem.startsWith(u8, line, "DEPTH")) {
-            var it = std.mem.tokenizeAny(u8, line[5..], " \t");
-            if (it.next()) |v| depth = try std.fmt.parseInt(usize, v, 10);
-        } else if (std.mem.startsWith(u8, line, "MAXVAL")) {
-            var it = std.mem.tokenizeAny(u8, line[6..], " \t");
-            if (it.next()) |v| maxval = try std.fmt.parseInt(usize, v, 10);
-        } else if (std.mem.startsWith(u8, line, "TUPLTYPE")) {
-            var it = std.mem.tokenizeAny(u8, line[8..], " \t");
-            if (it.next()) |v| tuple_type = v;
-        } else if (std.mem.eql(u8, line, "ENDHDR")) {
-            break;
-        }
-    }
-
-    if (width == 0 or height == 0 or depth == 0 or maxval == 0)
-        return error.InvalidPamDimensions;
-    if (maxval != 255) return error.UnsupportedPamMaxVal;
-    if (depth != 1 and depth != 2 and depth != 3 and depth != 4)
-        return error.UnsupportedPamDepth;
-
-    var channels: u8 = @intCast(depth);
-    if (std.ascii.eqlIgnoreCase(tuple_type, "GRAYSCALE")) {
-        if (depth != 1) return error.PamTupleMismatch;
-        channels = 1;
-    } else if (std.ascii.eqlIgnoreCase(tuple_type, "GRAYSCALE_ALPHA")) {
-        if (depth != 2) return error.PamTupleMismatch;
-        channels = 2;
-    } else if (std.ascii.eqlIgnoreCase(tuple_type, "RGB")) {
-        if (depth != 3) return error.PamTupleMismatch;
-        channels = 3;
-    } else if (std.ascii.eqlIgnoreCase(tuple_type, "RGB_ALPHA")) {
-        if (depth != 4) return error.PamTupleMismatch;
-        channels = 4;
-    } else if (std.ascii.eqlIgnoreCase(tuple_type, "BLACKANDWHITE")) {
-        // binary (maxval should be 1) - not supporting
-        return error.UnsupportedPamTuple;
-    }
-
-    const pixel_count = width * height;
-    const data_size = pixel_count * channels;
-    if (header_end + data_size > buf.len) return error.InsufficientDataInFile;
-
-    const out = try allocator.alloc(u8, pixel_count * channels);
-    errdefer allocator.free(out);
-    @memcpy(out, buf[header_end .. header_end + data_size]);
-
-    return .{
-        .width = width,
-        .height = height,
-        .channels = channels,
-        .data = out,
-    };
-}
-
 pub fn loadWebP(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
     const file = try std.Io.Dir.cwd().openFile(sys_io, path, .{});
     defer file.close(sys_io);
@@ -307,11 +211,57 @@ pub fn loadAVIF(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) 
     };
 }
 
+fn simpleImageToRaster(allocator: std.mem.Allocator, simple_in: imgio.Image) !Image {
+    var simple = simple_in;
+
+    if (simple.depth < 1 or simple.depth > 4) {
+        simple.deinit(allocator);
+        return error.UnsupportedChannelCount;
+    }
+
+    if (simple.maxval == 255 and simple.kind != .bitmap) {
+        return .{
+            .width = simple.width,
+            .height = simple.height,
+            .channels = simple.depth,
+            .data = simple.data,
+        };
+    }
+
+    var eight = simple.to8Bit(allocator) catch |err| {
+        simple.deinit(allocator);
+        return err;
+    };
+    simple.deinit(allocator);
+
+    if (eight.depth < 1 or eight.depth > 4) {
+        eight.deinit(allocator);
+        return error.UnsupportedChannelCount;
+    }
+    return .{
+        .width = eight.width,
+        .height = eight.height,
+        .channels = eight.depth,
+        .data = eight.data,
+    };
+}
+
+pub fn loadSimpleImage(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
+    const simple = if (hasExtension(path, ".qoi"))
+        try imgio.decodeQoiFile(sys_io, allocator, path)
+    else if (hasExtension(path, ".pam"))
+        try imgio.decodePamFile(sys_io, allocator, path)
+    else
+        try imgio.decodePnmFile(sys_io, allocator, path);
+
+    return simpleImageToRaster(allocator, simple);
+}
+
 pub fn loadImage(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8) !Image {
     if (hasExtension(path, ".png"))
         return loadPNG(allocator, sys_io, path)
-    else if (hasExtension(path, ".pam"))
-        return loadPAM(allocator, sys_io, path)
+    else if (hasExtension(path, ".pam") or hasExtension(path, ".pnm") or hasExtension(path, ".pbm") or hasExtension(path, ".pgm") or hasExtension(path, ".ppm") or hasExtension(path, ".qoi"))
+        return loadSimpleImage(allocator, sys_io, path)
     else if (hasExtension(path, ".jpg") or hasExtension(path, ".jpeg"))
         return loadJPEG(allocator, sys_io, path)
     else if (hasExtension(path, ".webp"))
@@ -319,7 +269,7 @@ pub fn loadImage(allocator: std.mem.Allocator, sys_io: std.Io, path: []const u8)
     else if (hasExtension(path, ".avif"))
         return loadAVIF(allocator, sys_io, path)
     else {
-        print("Error: Unrecognized image format; fssimu2 supports PNG, PAM, JPG, WEBP, or AVIF\n", .{});
+        print("Error: Unrecognized image format; fssimu2 supports PNG, PNM/PAM, QOI, JPG, WEBP, AVIF, or Y4M\n", .{});
         return error.UnrecognizedImageFormat;
     }
 }
@@ -372,43 +322,34 @@ pub fn toRGB8(allocator: std.mem.Allocator, img: Image) ![]u8 {
     return rgb;
 }
 
-pub fn yuv420ToRGB8(allocator: std.mem.Allocator, width: usize, height: usize, y: []const u8, u: []const u8, v: []const u8, bit_depth: u8) ![]u8 {
-    const pixels = width * height;
-    const rgb = try allocator.alloc(u8, pixels * 3);
-    try yuv420ToRGB8Into(rgb, width, height, y, u, v, bit_depth);
-    return rgb;
+pub fn yuv420FrameToRGB8Into(allocator: std.mem.Allocator, dst: []u8, frame: imgio.YuvFrame) !void {
+    var eight_storage: ?imgio.YuvFrame = null;
+    defer if (eight_storage) |*eight| eight.deinit(allocator);
+
+    const frame8 = if (frame.bit_depth == .b8) frame else blk: {
+        eight_storage = try frame.to8Bit(allocator);
+        break :blk eight_storage.?;
+    };
+
+    try yuv420ToRGB8Into(dst, frame8.width, frame8.height, frame8.y, frame8.u, frame8.v);
 }
 
-pub fn yuv420ToRGB8Into(dst: []u8, width: usize, height: usize, y: []const u8, u: []const u8, v: []const u8, bit_depth: u8) !void {
+fn yuv420ToRGB8Into(dst: []u8, width: usize, height: usize, y: []const u8, u: []const u8, v: []const u8) !void {
     const pixels = width * height;
     if (dst.len < pixels * 3) return error.BufferTooSmall;
-
-    const y_ptr = y.ptr;
-    const u_ptr = u.ptr;
-    const v_ptr = v.ptr;
+    if (y.len < pixels) return error.BadPlaneSize;
+    const chroma_width = (width + 1) / 2;
+    const chroma_height = (height + 1) / 2;
+    if (u.len < chroma_width * chroma_height or v.len < chroma_width * chroma_height) return error.BadPlaneSize;
 
     for (0..height) |j| {
         for (0..width) |i| {
             const y_idx = j * width + i;
-            const uv_idx = (j / 2) * (width / 2) + (i / 2);
+            const uv_idx = (j / 2) * chroma_width + (i / 2);
 
-            var py: f32 = undefined;
-            var pu: f32 = undefined;
-            var pv: f32 = undefined;
-
-            if (bit_depth == 8) {
-                py = @floatFromInt(y[y_idx]);
-                pu = @floatFromInt(u[uv_idx]);
-                pv = @floatFromInt(v[uv_idx]);
-            } else {
-                const y_u16 = @as(*align(1) const u16, @ptrCast(y_ptr + y_idx * 2)).*;
-                const u_u16 = @as(*align(1) const u16, @ptrCast(u_ptr + uv_idx * 2)).*;
-                const v_u16 = @as(*align(1) const u16, @ptrCast(v_ptr + uv_idx * 2)).*;
-                // Scale 10-bit to 8-bit range for the formula
-                py = @as(f32, @floatFromInt(y_u16)) / 4.0;
-                pu = @as(f32, @floatFromInt(u_u16)) / 4.0;
-                pv = @as(f32, @floatFromInt(v_u16)) / 4.0;
-            }
+            const py: f32 = @floatFromInt(y[y_idx]);
+            const pu: f32 = @floatFromInt(u[uv_idx]);
+            const pv: f32 = @floatFromInt(v[uv_idx]);
 
             // BT.709 YUV to RGB conversion (limited range)
             const y_f = (py - 16.0) / 219.0;
