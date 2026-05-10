@@ -12,6 +12,10 @@ pub const Ssimu2Error = error{
 
 const K_SIZE = 9;
 const RADIUS = 4;
+const VEC_LEN = 8;
+const F32x8 = @Vector(VEC_LEN, f32);
+const F32x4 = @Vector(4, f32);
+const F64x4 = @Vector(4, f64);
 
 pub const Workspace = struct {
     allocator: std.mem.Allocator,
@@ -139,11 +143,26 @@ pub fn computeSsimu2(
     return computeSsimu2WithWorkspace(&workspace, reference, distorted, width, height, channels, error_map);
 }
 
+inline fn loadF32x8(src: []const f32, index: usize) F32x8 {
+    return @as(*align(1) const F32x8, @ptrCast(src.ptr + index)).*;
+}
+
+inline fn storeF32x8(dst: []f32, index: usize, value: F32x8) void {
+    @as(*align(1) F32x8, @ptrCast(dst.ptr + index)).* = value;
+}
+
+inline fn loadF32x4(src: []const f32, index: usize) F32x4 {
+    return @as(*align(1) const F32x4, @ptrCast(src.ptr + index)).*;
+}
+
 inline fn multiply(src1: []const f32, src2: []const f32, dst: []f32, stride: u32, w: u32, h: u32) void {
     var y: u32 = 0;
     while (y < h) : (y += 1) {
-        const row = y * stride;
-        var x: u32 = 0;
+        const row: usize = @as(usize, y) * stride;
+        var x: usize = 0;
+        while (x + VEC_LEN <= w) : (x += VEC_LEN) {
+            storeF32x8(dst, row + x, loadF32x8(src1, row + x) * loadF32x8(src2, row + x));
+        }
         while (x < w) : (x += 1) {
             dst[row + x] = src1[row + x] * src2[row + x];
         }
@@ -168,7 +187,16 @@ fn blurH(srcp: []const f32, dstp: []f32, kernel: [K_SIZE]f32, w: i32) void {
         dstp[@intCast(j)] = sum;
     }
 
-    j = RADIUS;
+    const interior_end: usize = @intCast(w - @min(w, RADIUS));
+    var ju: usize = RADIUS;
+    while (ju + VEC_LEN <= interior_end) : (ju += VEC_LEN) {
+        var sum: F32x8 = @splat(0.0);
+        inline for (0..K_SIZE) |k|
+            sum += @as(F32x8, @splat(kernel[k])) * loadF32x8(srcp, ju + k - RADIUS);
+        storeF32x8(dstp, ju, sum);
+    }
+
+    j = @intCast(ju);
     while (j < w - @min(w, RADIUS)) : (j += 1) {
         var sum: f32 = 0.0;
         var k: i32 = 0;
@@ -197,7 +225,13 @@ fn blurH(srcp: []const f32, dstp: []f32, kernel: [K_SIZE]f32, w: i32) void {
 }
 
 inline fn blurV(src: anytype, dstp: []f32, kernel: [K_SIZE]f32, w: u32) void {
-    var j: u32 = 0;
+    var j: usize = 0;
+    while (j + VEC_LEN <= w) : (j += VEC_LEN) {
+        var accum: F32x8 = @splat(0.0);
+        inline for (0..K_SIZE) |k|
+            accum += @as(F32x8, @splat(kernel[k])) * loadF32x8(src[k], j);
+        storeF32x8(dstp, j, accum);
+    }
     while (j < w) : (j += 1) {
         var accum: f32 = 0.0;
         var k: u32 = 0;
@@ -494,7 +528,32 @@ inline fn ssimMap(
     var y: u32 = 0;
     while (y < h) : (y += 1) {
         const row = y * stride;
-        var x: u32 = 0;
+        var x: usize = 0;
+        if (error_map == null) {
+            var sum_d: F64x4 = @splat(0.0);
+            var sum_d4: F64x4 = @splat(0.0);
+            while (x + 4 <= w) : (x += 4) {
+                const m1: F64x4 = @floatCast(loadF32x4(mu1, row + x));
+                const m2: F64x4 = @floatCast(loadF32x4(mu2, row + x));
+                const s11v: F64x4 = @floatCast(loadF32x4(s11, row + x));
+                const s22v: F64x4 = @floatCast(loadF32x4(s22, row + x));
+                const s12v: F64x4 = @floatCast(loadF32x4(s12, row + x));
+
+                const m11 = m1 * m1;
+                const m22 = m2 * m2;
+                const m12 = m1 * m2;
+                const m_diff = m1 - m2;
+                const num_m = @as(F64x4, @splat(1.0)) - m_diff * m_diff;
+                const num_s = (s12v - m12) * @as(F64x4, @splat(2.0)) + @as(F64x4, @splat(0.0009));
+                const denom_s = (s11v - m11) + (s22v - m22) + @as(F64x4, @splat(0.0009));
+                const d = @max(@as(F64x4, @splat(1.0)) - ((num_m * num_s) / denom_s), @as(F64x4, @splat(0.0)));
+                const d2 = d * d;
+                sum_d += d;
+                sum_d4 += d2 * d2;
+            }
+            sum1[0] += @reduce(.Add, sum_d);
+            sum1[1] += @reduce(.Add, sum_d4);
+        }
         while (x < w) : (x += 1) {
             const m1: f32 = @floatCast(mu1[row + x]);
             const m2: f32 = @floatCast(mu2[row + x]);
@@ -540,7 +599,34 @@ inline fn edgeMap(
     var y: u32 = 0;
     while (y < h) : (y += 1) {
         const row = y * stride;
-        var x: u32 = 0;
+        var x: usize = 0;
+        if (error_map == null) {
+            var sum_artifact: F64x4 = @splat(0.0);
+            var sum_artifact4: F64x4 = @splat(0.0);
+            var sum_lost: F64x4 = @splat(0.0);
+            var sum_lost4: F64x4 = @splat(0.0);
+            while (x + 4 <= w) : (x += 4) {
+                const im1v: F64x4 = @floatCast(loadF32x4(im1, row + x));
+                const im2v: F64x4 = @floatCast(loadF32x4(im2, row + x));
+                const mu1v: F64x4 = @floatCast(loadF32x4(mu1, row + x));
+                const mu2v: F64x4 = @floatCast(loadF32x4(mu2, row + x));
+
+                const d = (@as(F64x4, @splat(1.0)) + @abs(im2v - mu2v)) /
+                    (@as(F64x4, @splat(1.0)) + @abs(im1v - mu1v)) - @as(F64x4, @splat(1.0));
+                const artifact = @max(d, @as(F64x4, @splat(0.0)));
+                const detail_lost = @max(-d, @as(F64x4, @splat(0.0)));
+                const artifact2 = artifact * artifact;
+                const lost2 = detail_lost * detail_lost;
+                sum_artifact += artifact;
+                sum_artifact4 += artifact2 * artifact2;
+                sum_lost += detail_lost;
+                sum_lost4 += lost2 * lost2;
+            }
+            sum2[0] += @reduce(.Add, sum_artifact);
+            sum2[1] += @reduce(.Add, sum_artifact4);
+            sum2[2] += @reduce(.Add, sum_lost);
+            sum2[3] += @reduce(.Add, sum_lost4);
+        }
         while (x < w) : (x += 1) {
             const d1: f64 = (1.0 + @as(f64, @abs(@as(f32, @floatCast(im2[row + x])) - @as(f32, @floatCast(mu2[row + x]))))) /
                 (1.0 + @as(f64, @abs(@as(f32, @floatCast(im1[row + x])) - @as(f32, @floatCast(mu1[row + x]))))) - 1.0;
