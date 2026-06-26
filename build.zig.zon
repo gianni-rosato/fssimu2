@@ -3,8 +3,8 @@
     .version = "0.2.0",
     .dependencies = .{
         .simpleimgio = .{
-            .url = "git+https://github.com/gianni-rosato/simpleimgio.git#3a4e451b1b27139c69a06fe9ccaeabf89adb33e9",
-            .hash = "simpleimgio-0.0.0-oHTuOZe-AAC1Hc8tH4l0WETz8rooAP3mKMivmEdq5THN",
+            .url = "git+https://github.com/gianni-rosato/simpleimgio.git#988a6b730eb4ad99ee4205ef40c035ded6a2099d",
+            .hash = "simpleimgio-0.0.0-oHTuOTfLAACpIG8VkUMQJOTXytlnfi2AVf83GwFXOtBP",
         },
     },
     .fingerprint = 0xda707f180d3775f3, // Changing this has security and trust implications.
