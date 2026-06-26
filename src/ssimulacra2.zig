@@ -415,6 +415,12 @@ inline fn getWeight(c: i32, scale: i32, map: i32, norm: i32) f64 {
     return weight[@intCast(idx)];
 }
 
+inline fn activeWeight(plane: i32, scale: i32, map: i32) bool {
+    const w0 = @abs(getWeight(plane, scale, map, 0));
+    const w1 = @abs(getWeight(plane, scale, map, 1));
+    return @max(w0, w1) > 0.01;
+}
+
 const K_M02 = 0.078;
 const K_M00 = 0.30;
 const K_M01 = V10 - K_M02 - K_M00;
@@ -793,8 +799,8 @@ fn processWithScratch(
             srcp2b[i][j] = @floatCast(v);
     }
 
-    var plane_avg_ssim: [6][6]f64 = undefined;
-    var plane_avg_edge: [6][12]f64 = undefined;
+    var plane_avg_ssim: [6][6]f64 = std.mem.zeroes([6][6]f64);
+    var plane_avg_edge: [6][12]f64 = std.mem.zeroes([6][12]f64);
     var stride2 = stride;
     var w2 = w;
     var h2 = h;
@@ -818,50 +824,57 @@ fn processWithScratch(
         toXYB(srcp1b, tmpp1, stride2, w2, h2);
         toXYB(srcp2b, tmpp2, stride2, w2, h2);
 
-        var plane: u32 = 0;
-        while (plane < 3) : (plane += 1) {
-            multiply(tmpp1[plane], tmpp1[plane], tmpp3, stride2, w2, h2);
-            blur(tmpp3, tmpps11, stride2, w2, h2, scratch);
+        for (0..3) |plane| {
+            const ssim_on = activeWeight(@intCast(plane), @intCast(scale), 0);
+            const edge_on = activeWeight(@intCast(plane), @intCast(scale), 1) or
+                activeWeight(@intCast(plane), @intCast(scale), 2);
 
-            multiply(tmpp2[plane], tmpp2[plane], tmpp3, stride2, w2, h2);
-            blur(tmpp3, tmpps22, stride2, w2, h2, scratch);
+            if (ssim_on) {
+                multiply(tmpp1[plane], tmpp1[plane], tmpp3, stride2, w2, h2);
+                blur(tmpp3, tmpps11, stride2, w2, h2, scratch);
+                multiply(tmpp2[plane], tmpp2[plane], tmpp3, stride2, w2, h2);
+                blur(tmpp3, tmpps22, stride2, w2, h2, scratch);
+                multiply(tmpp1[plane], tmpp2[plane], tmpp3, stride2, w2, h2);
+                blur(tmpp3, tmpps12, stride2, w2, h2, scratch);
+            }
 
-            multiply(tmpp1[plane], tmpp2[plane], tmpp3, stride2, w2, h2);
-            blur(tmpp3, tmpps12, stride2, w2, h2, scratch);
+            if (ssim_on or edge_on) {
+                blur(tmpp1[plane], tmppmu1, stride2, w2, h2, scratch);
+                blur(tmpp2[plane], tmpp3, stride2, w2, h2, scratch);
+            }
 
-            blur(tmpp1[plane], tmppmu1, stride2, w2, h2, scratch);
-            blur(tmpp2[plane], tmpp3, stride2, w2, h2, scratch);
+            if (ssim_on)
+                ssimMap(
+                    tmpps11,
+                    tmpps22,
+                    tmpps12,
+                    tmppmu1,
+                    tmpp3,
+                    stride2,
+                    w2,
+                    h2,
+                    @intCast(plane),
+                    one_per_pixels,
+                    &plane_avg_ssim[scale],
+                    if (error_map != null) error_scale else null,
+                    scale,
+                );
 
-            ssimMap(
-                tmpps11,
-                tmpps22,
-                tmpps12,
-                tmppmu1,
-                tmpp3,
-                stride2,
-                w2,
-                h2,
-                plane,
-                one_per_pixels,
-                &plane_avg_ssim[scale],
-                if (error_map != null) error_scale else null,
-                scale,
-            );
-
-            edgeMap(
-                tmpp1[plane],
-                tmpp2[plane],
-                tmppmu1,
-                tmpp3,
-                stride2,
-                w2,
-                h2,
-                plane,
-                one_per_pixels,
-                &plane_avg_edge[scale],
-                if (error_map != null) error_scale else null,
-                @intCast(scale),
-            );
+            if (edge_on)
+                edgeMap(
+                    tmpp1[plane],
+                    tmpp2[plane],
+                    tmppmu1,
+                    tmpp3,
+                    stride2,
+                    w2,
+                    h2,
+                    @intCast(plane),
+                    one_per_pixels,
+                    &plane_avg_edge[scale],
+                    if (error_map != null) error_scale else null,
+                    @intCast(scale),
+                );
         }
 
         if (error_map != null) {
